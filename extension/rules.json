@@ -1,0 +1,40 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://labs.google/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://labs.google"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "aisandbox-pa.googleapis.com",
+      "resourceTypes": ["xmlhttprequest"]
+    }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "X-Frame-Options", "operation": "remove" },
+        { "header": "Content-Security-Policy", "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||labs.google^",
+      "resourceTypes": ["sub_frame", "main_frame"]
+    }
+  }
+]
