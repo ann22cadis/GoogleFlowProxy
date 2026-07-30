@@ -1,5 +1,5 @@
 /**
- * Flow Kit — Offscreen Document Keepalive
+ * Flow — Offscreen Document Keepalive
  *
  * Этот документ живёт в фоне и будит Service Worker каждые 10 секунд.
  * Chrome не убивает offscreen документы так агрессивно, как SW на Android.

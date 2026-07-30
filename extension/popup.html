@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Flow Kit</title>
+  <title>Flow</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -50,7 +50,7 @@
 
     .header-title span { color: var(--accent); }
 
-    #btn-panel, #btn-embed {
+    #btn-panel, #btn-embed, #btn-audio {
       padding: 4px 10px;
       font-family: var(--font);
       font-size: 9px;
@@ -64,7 +64,8 @@
       cursor: pointer;
     }
 
-    #btn-panel:hover, #btn-embed:hover { background: var(--accent); }
+    #btn-panel:hover, #btn-embed:hover, #btn-audio:hover { background: var(--accent); }
+    #btn-audio.off { background: transparent; color: var(--muted); }
 
     .log-header {
       display: flex;
@@ -229,8 +230,9 @@
 </head>
 <body>
   <header>
-    <div class="header-title"><span>Flow Kit</span> Extension</div>
+    <div class="header-title"><span>Flow</span> Extension</div>
     <button id="btn-embed" title="Embed Labs iframe in this tab (Anti-Sleep)">Anti-Sleep</button>
+    <button id="btn-audio" title="Silent audio keeps Android from freezing the tab">Audio: ?</button>
     <button id="btn-panel">Side Panel</button>
   </header>
 

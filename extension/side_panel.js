@@ -1,5 +1,5 @@
 /**
- * Flow Kit — Side Panel
+ * Flow — Side Panel
  * Displays live connection status, metrics, and request log.
  */
 

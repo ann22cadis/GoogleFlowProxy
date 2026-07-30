@@ -1,111 +1,102 @@
 /**
- * Content script — bridge between background.js and injected.js
- * Injects injected.js into MAIN world to access window.grecaptcha
+ * Content script на labs.google — мост между background.js и injected.js.
+ * Работает во ВСЕХ фреймах, включая скрытый iframe, который st_injector.js
+ * вставляет во вкладку SillyTavern: капчу умеет выдавать любой фрейм
+ * с origin labs.google, и такой iframe переживает Android гораздо лучше,
+ * чем отдельная вкладка Labs.
  */
-(function () {
-  const s = document.createElement('script');
-  s.src = chrome.runtime.getURL('injected.js');
-  s.onload = () => s.remove();
-  (document.head || document.documentElement).appendChild(s);
-})();
 
-chrome.runtime.onMessage.addListener((msg, _, reply) => {
-  if (msg.type !== 'GET_CAPTCHA') return;
+// Скрипт может быть внедрён повторно через chrome.scripting — не дублируем слушателей
+if (!window.__flowContentLoaded) {
+  window.__flowContentLoaded = true;
 
-  const { requestId, pageAction } = msg;
+  (function injectMainWorld() {
+    const s = document.createElement('script');
+    s.src = chrome.runtime.getURL('injected.js');
+    s.onload = () => s.remove();
+    (document.head || document.documentElement).appendChild(s);
+  })();
 
-  const handler = (e) => {
-    if (e.detail?.requestId === requestId) {
+  chrome.runtime.onMessage.addListener((msg, _, reply) => {
+    if (msg.type !== 'GET_CAPTCHA') return;
+
+    const { requestId, pageAction } = msg;
+
+    const handler = (e) => {
+      if (e.detail?.requestId === requestId) {
+        window.removeEventListener('CAPTCHA_RESULT', handler);
+        clearTimeout(timer);
+        reply({ token: e.detail.token, error: e.detail.error });
+      }
+    };
+
+    // Должен быть короче таймаута в background.js (35 с), чтобы фон получил
+    // внятную ошибку и успел попробовать другой фрейм.
+    const timer = setTimeout(() => {
       window.removeEventListener('CAPTCHA_RESULT', handler);
-      clearTimeout(timer);
-      reply({ token: e.detail.token, error: e.detail.error });
+      reply({ error: 'CONTENT_TIMEOUT' });
+    }, 30000);
+
+    window.addEventListener('CAPTCHA_RESULT', handler);
+    window.dispatchEvent(new CustomEvent('GET_CAPTCHA', { detail: { requestId, pageAction } }));
+
+    return true; // держим канал открытым для асинхронного ответа
+  });
+
+  // ─── TRPC Media URL Monitor ───────────────────────────────
+  window.addEventListener('TRPC_MEDIA_URLS', (e) => {
+    const { url, body } = e.detail || {};
+    if (!body) return;
+    chrome.runtime.sendMessage({ type: 'TRPC_MEDIA_URLS', trpcUrl: url, body }).catch(() => {});
+  });
+
+  // ─── Порт до Service Worker ───────────────────────────────
+  // Открытый порт не даёт воркеру уснуть и заодно сообщает фону, что в этом
+  // фрейме можно решать капчу. Chrome принудительно рвёт порт через 5 минут,
+  // поэтому пересоздаём его сами каждые 4 минуты, не дожидаясь обрыва.
+  (function startPortKeepalive() {
+    let port = null;
+    let pingTimer = null;
+    let recycleTimer = null;
+
+    function cleanup() {
+      clearInterval(pingTimer);
+      clearTimeout(recycleTimer);
     }
-  };
 
-  const timer = setTimeout(() => {
-    window.removeEventListener('CAPTCHA_RESULT', handler);
-    reply({ error: 'CONTENT_TIMEOUT' });
-  }, 25000);
+    function connect() {
+      cleanup();
+      try {
+        port = chrome.runtime.connect({ name: 'flow-frame' });
 
-  window.addEventListener('CAPTCHA_RESULT', handler);
+        pingTimer = setInterval(() => {
+          try {
+            port.postMessage({ type: 'ping' });
+          } catch {
+            cleanup();
+          }
+        }, 20000);
 
-  window.dispatchEvent(new CustomEvent('GET_CAPTCHA', {
-    detail: { requestId, pageAction },
-  }));
+        recycleTimer = setTimeout(() => {
+          try { port.disconnect(); } catch {}
+          connect();
+        }, 4 * 60 * 1000);
 
-  return true; // keep channel open for async reply
-});
-
-// ─── TRPC Media URL Monitor ─────────────────────────────────
-// Forward intercepted TRPC responses with media URLs to background.js
-window.addEventListener('TRPC_MEDIA_URLS', (e) => {
-  const { url, body } = e.detail || {};
-  if (!body) return;
-  chrome.runtime.sendMessage({
-    type: 'TRPC_MEDIA_URLS',
-    trpcUrl: url,
-    body,
-  }).catch(() => {});
-});
-
-// ─── Persistent Port Keepalive (Android Anti-Kill) ──────────
-// Открытый chrome.runtime.connect() порт из content script держит SW живым.
-// Content script живёт в процессе вкладки — Android его не убивает так агрессивно.
-// Это самый надёжный способ держать MV3 Service Worker живым на Android.
-(function startPortKeepalive() {
-  let port = null;
-
-  function connect() {
-    try {
-      port = chrome.runtime.connect({ name: 'tab-keepalive' });
-
-      // Пингуем SW каждые 20 секунд через порт
-      const interval = setInterval(() => {
-        try {
-          port.postMessage({ type: 'ping' });
-        } catch {
-          clearInterval(interval);
-        }
-      }, 20000);
-
-      port.onDisconnect.addListener(() => {
-        clearInterval(interval);
-        // SW отключился — переподключаемся через 1 секунду
-        setTimeout(connect, 1000);
-      });
-    } catch (e) {
-      // Расширение могло обновиться — пробуем снова через 2 секунды
-      setTimeout(connect, 2000);
+        port.onDisconnect.addListener(() => {
+          cleanup();
+          setTimeout(connect, 1000);
+        });
+      } catch {
+        // Расширение могло обновиться — пробуем снова
+        setTimeout(connect, 2000);
+      }
     }
-  }
 
-  connect();
-})();
+    connect();
+  })();
 
-// ─── Ultimate Android Keepalive (HTML5 Audio) ──────────────
-// AudioContext иногда ставится на паузу агрессивными Android-оболочками.
-// Настоящий <audio> тег создаёт системную MediaSession, которую ОС не имеет права убивать.
-let _audioStarted = false;
-function startSilentAudio() {
-  if (_audioStarted) return;
-  _audioStarted = true;
-  try {
-    // 0.1 секунды абсолютной тишины в формате WAV
-    const silentWavBase64 = "UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    const audio = new Audio("data:audio/wav;base64," + silentWavBase64);
-    audio.loop = true;
-    audio.play().then(() => {
-      console.log('[Flow] HTML5 Silent audio keepalive started — Android will NOT kill this tab');
-    }).catch(e => {
-      console.error('[Flow] Audio play blocked:', e);
-      _audioStarted = false; // пробуем еще раз при следующем клике
-    });
-  } catch (e) {
-    console.error('[Flow] Audio keepalive failed', e);
-  }
+  // ─── Звуковой keepalive (см. keepalive.js) ────────────────
+  // Только в верхнем фрейме: если мы внутри iframe на странице SillyTavern,
+  // звук уже играет сама эта страница (st_injector.js), второй поток не нужен.
+  if (window.top === window) flowStartAudioKeepalive();
 }
-
-// Запускаем при любом взаимодействии с вкладкой Google Labs
-document.addEventListener('click', startSilentAudio);
-document.addEventListener('touchstart', startSilentAudio);
-

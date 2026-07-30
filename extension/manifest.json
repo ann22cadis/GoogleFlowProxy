@@ -1,22 +1,25 @@
 {
   "manifest_version": 3,
   "name": "Flow",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local agent bridge for Google Flow API — captures tokens, solves reCAPTCHA, proxies API calls",
   "permissions": [
     "storage",
     "alarms",
     "tabs",
     "webRequest",
+    "webNavigation",
     "scripting",
     "declarativeNetRequest",
+    "offscreen",
     "sidePanel",
     "activeTab"
   ],
   "host_permissions": [
     "https://labs.google/*",
     "https://aisandbox-pa.googleapis.com/*",
-    "http://127.0.0.1:8100/*"
+    "http://127.0.0.1:8001/*",
+    "http://localhost:8001/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -28,8 +31,10 @@
         "https://labs.google/fx/*/tools/flow*"
       ],
       "js": [
+        "keepalive.js",
         "content.js"
       ],
+      "all_frames": true,
       "run_at": "document_start"
     },
     {
@@ -37,7 +42,10 @@
         "http://127.0.0.1:*/*",
         "http://localhost:*/*"
       ],
-      "js": ["st_injector.js"],
+      "js": [
+        "keepalive.js",
+        "st_injector.js"
+      ],
       "run_at": "document_idle"
     }
   ],

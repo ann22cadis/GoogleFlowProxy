@@ -147,6 +147,35 @@ document.getElementById('btn-embed').addEventListener('click', () => {
   });
 });
 
+// Звуковой keepalive: единственное, что мешает Android заморозить вкладку,
+// но он забирает аудиофокус — поэтому пусть выключается одним нажатием.
+const audioBtn = document.getElementById('btn-audio');
+
+function renderAudioBtn(enabled) {
+  audioBtn.textContent = `Audio: ${enabled ? 'on' : 'off'}`;
+  audioBtn.classList.toggle('off', !enabled);
+  audioBtn.title = enabled
+    ? 'Неслышимый звук не даёт Android усыпить вкладку. Нажмите, чтобы выключить (музыка в других приложениях перестанет ставиться на паузу).'
+    : 'Защита от засыпания выключена — на телефоне прокси будет отваливаться. Нажмите, чтобы включить.';
+}
+
+chrome.storage.local.get('audioKeepalive', ({ audioKeepalive }) => {
+  renderAudioBtn(audioKeepalive !== false);
+});
+
+audioBtn.addEventListener('click', () => {
+  chrome.storage.local.get('audioKeepalive', ({ audioKeepalive }) => {
+    const next = audioKeepalive === false; // было выключено -> включаем
+    chrome.storage.local.set({ audioKeepalive: next }, () => {
+      renderAudioBtn(next);
+      // Настройка читается при старте content script — нужна перезагрузка вкладки
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id != null) chrome.tabs.reload(tabs[0].id);
+      });
+    });
+  });
+});
+
 chrome.runtime.sendMessage({ type: 'REQUEST_LOG' }, (data) => {
   if (chrome.runtime.lastError) return;
   if (data && data.log) renderLog(data.log);

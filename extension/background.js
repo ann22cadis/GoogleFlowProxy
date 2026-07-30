@@ -1,18 +1,37 @@
 /**
- * Flow Kit — Chrome Extension Background Service Worker
+ * Flow — Chrome Extension Background Service Worker
  *
- * Connects to local Python agent via WebSocket (agent runs WS server).
- * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
+ * Транспорт до Python-агента: HTTP long-poll (см. main.py).
+ *
+ * Почему не WebSocket: на Android система убивает MV3 Service Worker каждый
+ * раз, когда пользователь уходит из браузера или просто сворачивает вкладку.
+ * Постоянный сокет вместе с ним умирает, и все запросы теряются.
+ *
+ * Long-poll решает это сразу с двух сторон:
+ *   • висящий fetch сам по себе не даёт воркеру уснуть;
+ *   • если воркер всё-таки убили — задача осталась в очереди на сервере
+ *     и будет выдана заново, как только воркер оживёт.
  */
 
-const AGENT_WS_URL = 'ws://127.0.0.1:8001/ws';
-// NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
-const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
+const AGENT_BASE = 'http://127.0.0.1:8001';
+const POLL_URL = `${AGENT_BASE}/api/ext/poll?wait=25`;
+const CALLBACK_URL = `${AGENT_BASE}/api/ext/callback`;
 
-let ws = null;
+const FLOW_URL = 'https://labs.google/fx/tools/flow';
+const FLOW_TAB_PATTERNS = [
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+];
+
+// На Android вкладка тормознутая: grecaptcha после разморозки отвечает
+// по 10–20 секунд. Старые 5 секунд гарантировали вечный CAPTCHA_TIMEOUT.
+const CAPTCHA_TIMEOUT_MS = 35000;
+const TAB_WAKE_TIMEOUT_MS = 25000;
+const TOKEN_REFRESH_WAIT_MS = 25000;
+
 let flowKey = null;
-let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
-let state = 'off'; // off | idle | running
+let flowKeyCapturedAt = null;
+let state = 'off';
 let manualDisconnect = false;
 let metrics = {
   tokenCapturedAt: null,
@@ -21,10 +40,461 @@ let metrics = {
   failedCount: 0,
   lastError: null,
 };
+let requestLog = [];
 
-// ─── URL → Log Type Classifier ─────────────────────────────
+// ─── Инициализация ──────────────────────────────────────────
+// Service Worker на Android перезапускается постоянно, и при перезапуске
+// выполняется ТОЛЬКО top-level код — прежний init() по onInstalled/onStartup
+// не вызывался, из-за чего flowKey оставался null и каждый запрос падал
+// с NO_FLOW_KEY. Теперь состояние подтягивается при любом оживлении.
 
-// Visible log types — only these appear in the request log
+let _initPromise = null;
+
+function ensureInit() {
+  if (!_initPromise) _initPromise = doInit();
+  return _initPromise;
+}
+
+async function doInit() {
+  try {
+    const d = await chrome.storage.local.get([
+      'flowKey', 'flowKeyCapturedAt', 'metrics', 'manualDisconnect', 'requestLog',
+    ]);
+    if (d.flowKey) flowKey = d.flowKey;
+    if (d.flowKeyCapturedAt) flowKeyCapturedAt = d.flowKeyCapturedAt;
+    if (d.metrics) Object.assign(metrics, d.metrics);
+    if (Array.isArray(d.requestLog)) requestLog = d.requestLog;
+    manualDisconnect = !!d.manualDisconnect;
+  } catch (e) {
+    console.warn('[Flow] Не смогли прочитать storage:', e);
+  }
+  setupAlarms();
+  ensureOffscreenDocument();
+}
+
+function setupAlarms() {
+  // Будильники переживают смерть воркера — в отличие от setInterval,
+  // который умирал вместе с ним и больше никогда не запускался.
+  chrome.alarms.create('poll-watchdog', { periodInMinutes: 0.5 });
+  chrome.alarms.create('token-refresh', { periodInMinutes: 30 });
+  chrome.alarms.create('telemetry', { periodInMinutes: 2 });
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  await ensureInit();
+  if (alarm.name === 'poll-watchdog') {
+    startPolling();
+    ensureOffscreenDocument();
+  } else if (alarm.name === 'token-refresh') {
+    await refreshToken();
+  } else if (alarm.name === 'telemetry') {
+    // Не на каждый будильник — чтобы интервалы выглядели живыми
+    if (Math.random() < 0.45) await sendTelemetry();
+  }
+});
+
+chrome.runtime.onInstalled.addListener(() => { ensureInit().then(startPolling); });
+chrome.runtime.onStartup.addListener(() => { ensureInit().then(startPolling); });
+
+// Главное: старт при КАЖДОМ оживлении воркера, чем бы оно ни было вызвано.
+ensureInit().then(startPolling);
+
+// ─── Реестр живых Flow-фреймов ──────────────────────────────
+// Вкладка labs.google на Android легко выгружается. Но captcha умеет выдавать
+// любой фрейм с origin labs.google — в том числе скрытый iframe, который
+// st_injector.js вставляет прямо во вкладку SillyTavern. Такой фрейм живёт
+// ровно столько, сколько открыта вкладка, которой пользователь реально
+// пользуется, поэтому он куда надёжнее отдельной вкладки Labs.
+
+const flowFrames = new Map(); // "tabId:frameId" -> { tabId, frameId, url, ts }
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'flow-frame') return;
+
+  const tabId = port.sender?.tab?.id;
+  const frameId = port.sender?.frameId ?? 0;
+  const url = port.sender?.url || '';
+  if (tabId == null || !url.startsWith('https://labs.google/')) return;
+
+  const key = `${tabId}:${frameId}`;
+  flowFrames.set(key, { tabId, frameId, url, ts: Date.now() });
+  console.log(`[Flow] Фрейм ${key} на связи`);
+
+  port.onMessage.addListener(() => {
+    const f = flowFrames.get(key);
+    if (f) f.ts = Date.now();
+    ensureInit().then(startPolling);
+  });
+
+  port.onDisconnect.addListener(() => flowFrames.delete(key));
+
+  ensureInit().then(startPolling);
+});
+
+// ─── Long-poll цикл ─────────────────────────────────────────
+
+let _pollActive = false;
+
+async function startPolling() {
+  if (_pollActive || manualDisconnect) return;
+  _pollActive = true;
+
+  let failures = 0;
+  try {
+    while (!manualDisconnect) {
+      let jobs = [];
+      try {
+        const resp = await fetch(POLL_URL, { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        jobs = (await resp.json()).jobs || [];
+        if (state === 'off') setState('idle');
+        failures = 0;
+      } catch (e) {
+        failures++;
+        setState('off');
+        // Сервер не запущен — не крутим цикл вхолостую, воркер разбудит будильник
+        if (failures >= 3) break;
+        await sleep(2000 * failures);
+        continue;
+      }
+
+      for (const job of jobs) {
+        ackJob(job.id);
+        // Намеренно без await: сразу возвращаемся к поллингу, чтобы висящий
+        // fetch продолжал держать воркер живым, пока задача выполняется.
+        handleJob(job);
+      }
+    }
+  } finally {
+    _pollActive = false;
+  }
+}
+
+function ackJob(id) {
+  // Подтверждаем приём: сервер поймёт, что задача не потерялась,
+  // и не выдаст её второй раз (иначе можно дважды сжечь генерацию).
+  fetch(CALLBACK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, ack: true }),
+  }).catch(() => {});
+}
+
+async function handleJob(job) {
+  try {
+    await ensureInit();
+    if (job.method === 'api_request') {
+      await handleApiRequest(job);
+    } else if (job.method === 'trpc_request') {
+      await handleTrpcRequest(job);
+    } else if (job.method === 'solve_captcha') {
+      await handleSolveCaptcha(job);
+    } else if (job.method === 'get_status') {
+      await sendToAgent({
+        id: job.id,
+        result: {
+          state,
+          flowKeyPresent: !!flowKey,
+          manualDisconnect,
+          tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+          metrics,
+        },
+      });
+    } else {
+      await sendToAgent({ id: job.id, error: `UNKNOWN_METHOD: ${job.method}` });
+    }
+  } catch (e) {
+    console.error('[Flow] Ошибка обработки задачи:', e);
+    await sendToAgent({ id: job.id, error: e?.message || 'JOB_FAILED' });
+  }
+}
+
+async function sendToAgent(msg) {
+  // Ответ уходит обычным HTTP — он не зависит от состояния соединения
+  // и доходит, даже если воркер только что перезапустился.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const resp = await fetch(CALLBACK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(msg),
+      });
+      if (resp.ok) return true;
+    } catch {}
+    await sleep(400 * (attempt + 1));
+  }
+  console.error('[Flow] Не смогли доставить ответ агенту:', msg.id);
+  return false;
+}
+
+// ─── Токен ──────────────────────────────────────────────────
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (!details?.requestHeaders?.length) return;
+    const authHeader = details.requestHeaders.find(
+      (h) => h.name?.toLowerCase() === 'authorization',
+    );
+    const value = authHeader?.value || '';
+    if (!value.startsWith('Bearer ya29.')) return;
+
+    const token = value.replace(/^Bearer\s+/i, '').trim();
+    if (!token) return;
+
+    flowKey = token;
+    flowKeyCapturedAt = Date.now();
+    metrics.tokenCapturedAt = flowKeyCapturedAt;
+    chrome.storage.local.set({ flowKey, flowKeyCapturedAt, metrics });
+    console.log('[Flow] Токен пойман');
+  },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
+  ['requestHeaders', 'extraHeaders'],
+);
+
+async function getFlowKey() {
+  if (flowKey) return flowKey;
+  // Воркер мог перезапуститься уже после того, как токен был пойман
+  const d = await chrome.storage.local.get(['flowKey', 'flowKeyCapturedAt']);
+  if (d.flowKey) {
+    flowKey = d.flowKey;
+    flowKeyCapturedAt = d.flowKeyCapturedAt || null;
+  }
+  return flowKey;
+}
+
+async function refreshToken() {
+  // Токен ловится пассивно из трафика страницы, поэтому единственный
+  // надёжный способ его обновить — заставить страницу Flow сходить в сеть.
+  const before = flowKeyCapturedAt || 0;
+  const targets = await findCaptchaTargets();
+
+  if (!targets.length) {
+    const opened = await openFlowTab();
+    if (!opened) return false;
+  } else {
+    const t = targets[0];
+    try {
+      await chrome.tabs.reload(t.tabId);
+    } catch {
+      return false;
+    }
+  }
+
+  const deadline = Date.now() + TOKEN_REFRESH_WAIT_MS;
+  while (Date.now() < deadline) {
+    const d = await chrome.storage.local.get('flowKeyCapturedAt');
+    if ((d.flowKeyCapturedAt || 0) > before) {
+      flowKey = (await chrome.storage.local.get('flowKey')).flowKey;
+      flowKeyCapturedAt = d.flowKeyCapturedAt;
+      console.log('[Flow] Токен обновлён');
+      return true;
+    }
+    await sleep(1000);
+  }
+  console.warn('[Flow] Токен обновить не удалось');
+  return false;
+}
+
+// ─── Поиск вкладок и фреймов для капчи ──────────────────────
+
+async function findCaptchaTargets() {
+  const targets = [];
+  const seen = new Set();
+  const push = (t) => {
+    const k = `${t.tabId}:${t.frameId}`;
+    if (!seen.has(k)) { seen.add(k); targets.push(t); }
+  };
+
+  // Порядок здесь принципиален. reCAPTCHA Enterprise оценивает контекст, в
+  // котором её вызвали, и скрытый iframe размером с пиксель — классический
+  // признак бота: Google отвечает PUBLIC_ERROR_UNUSUAL_ACTIVITY и запрос
+  // падает с 403 "reCAPTCHA evaluation failed". Поэтому настоящая вкладка
+  // Labs идёт первой всегда, а iframe остаётся аварийным вариантом.
+
+  // 1. Настоящие вкладки labs.google: активная -> живая -> выгруженная
+  const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS }).catch(() => []);
+  const rank = (t) => (t.active ? -1 : 0) + (t.discarded ? 2 : 0);
+  tabs.sort((a, b) => rank(a) - rank(b));
+  for (const t of tabs) {
+    if (t.id != null) push({ tabId: t.id, frameId: 0, kind: 'вкладка Labs', discarded: !!t.discarded });
+  }
+
+  // 2. Верхнеуровневые фреймы, сообщившие о себе по порту
+  for (const f of [...flowFrames.values()].sort((a, b) => b.ts - a.ts)) {
+    if (f.frameId === 0) push({ ...f, kind: 'вкладка Labs' });
+  }
+
+  // 3. Только теперь — скрытые iframe (например, во вкладке SillyTavern)
+  for (const f of [...flowFrames.values()].sort((a, b) => b.ts - a.ts)) {
+    if (f.frameId !== 0) push({ ...f, kind: 'скрытый iframe' });
+  }
+
+  if (chrome.webNavigation) {
+    const all = await chrome.tabs.query({}).catch(() => []);
+    for (const t of all) {
+      if (t.id == null) continue;
+      const frames = await chrome.webNavigation.getAllFrames({ tabId: t.id }).catch(() => null);
+      if (!frames) continue;
+      for (const fr of frames) {
+        if (fr.frameId !== 0 && fr.url?.startsWith('https://labs.google/fx/')) {
+          push({ tabId: t.id, frameId: fr.frameId, kind: 'скрытый iframe' });
+        }
+      }
+    }
+  }
+
+  return targets;
+}
+
+async function wakeTab(tabId) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return false;
+  }
+  // Android выгружает фоновые вкладки: скрипт в них не отвечает,
+  // пока вкладку не перезагрузить.
+  if (tab.discarded || tab.status === 'unloaded') {
+    console.log(`[Flow] Вкладка ${tabId} была выгружена системой — поднимаем`);
+    try {
+      await chrome.tabs.reload(tabId);
+    } catch {
+      return false;
+    }
+    const ok = await waitForTabComplete(tabId, TAB_WAKE_TIMEOUT_MS);
+    if (!ok) return false;
+    await sleep(2500); // дать grecaptcha подгрузиться
+  }
+  return true;
+}
+
+async function waitForTabComplete(tabId, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === 'complete' && !tab.discarded) return true;
+    } catch {
+      return false;
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+let _openingFlowTab = false;
+
+async function openFlowTab() {
+  if (_openingFlowTab) return false;
+
+  // Флаг в памяти сбрасывается вместе с воркером, поэтому дублируем его
+  // в storage — иначе на Android расширение наплодит десяток вкладок Flow.
+  const now = Date.now();
+  const { lastFlowTabOpen = 0 } = await chrome.storage.local.get('lastFlowTabOpen');
+  if (now - lastFlowTabOpen < 30000) return false;
+
+  _openingFlowTab = true;
+  await chrome.storage.local.set({ lastFlowTabOpen: now });
+  try {
+    console.log('[Flow] Вкладки Labs нет — открываем в фоне');
+    await chrome.tabs.create({ url: FLOW_URL, active: false });
+    const deadline = Date.now() + TAB_WAKE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(1500);
+      const targets = await findCaptchaTargets();
+      if (targets.length) return true;
+    }
+    return false;
+  } catch (e) {
+    console.error('[Flow] Не смогли открыть вкладку Flow:', e);
+    return false;
+  } finally {
+    _openingFlowTab = false;
+  }
+}
+
+// ─── Капча ──────────────────────────────────────────────────
+
+async function requestCaptchaFromFrame(target, requestId, pageAction) {
+  const { tabId, frameId } = target;
+  const message = { type: 'GET_CAPTCHA', requestId, pageAction };
+  const options = frameId != null ? { frameId } : undefined;
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, message, options);
+  } catch (error) {
+    const msg = error?.message || '';
+    const shouldInject =
+      msg.includes('Receiving end does not exist') ||
+      msg.includes('Could not establish connection');
+    if (!shouldInject) throw error;
+
+    await chrome.scripting.executeScript({
+      target: frameId != null ? { tabId, frameIds: [frameId] } : { tabId },
+      files: ['content.js'],
+    });
+    await sleep(500);
+    return await chrome.tabs.sendMessage(tabId, message, options);
+  }
+}
+
+function withTimeout(promise, ms, errName) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(errName)), ms)),
+  ]);
+}
+
+async function solveCaptcha(requestId, captchaAction) {
+  await ensureInit();
+
+  let targets = await findCaptchaTargets();
+  if (!targets.length) {
+    const opened = await openFlowTab();
+    if (!opened) return { error: 'NO_FLOW_TAB' };
+    targets = await findCaptchaTargets();
+    if (!targets.length) return { error: 'NO_FLOW_TAB' };
+  }
+
+  // Пробуем несколько источников: первый мог быть заморожен системой.
+  let lastError = 'CAPTCHA_FAILED';
+  for (const target of targets.slice(0, 3)) {
+    try {
+      if (!(await wakeTab(target.tabId))) continue;
+      const resp = await withTimeout(
+        requestCaptchaFromFrame(target, requestId, captchaAction),
+        CAPTCHA_TIMEOUT_MS,
+        'CAPTCHA_TIMEOUT',
+      );
+      if (resp?.token) return { ...resp, source: target.kind || 'неизвестно' };
+      lastError = resp?.error || 'NO_TOKEN';
+    } catch (e) {
+      lastError = e?.message || 'CAPTCHA_TIMEOUT';
+      console.warn(`[Flow] Фрейм ${target.tabId}:${target.frameId} не выдал токен — ${lastError}`);
+    }
+  }
+  return { error: lastError };
+}
+
+async function handleSolveCaptcha(msg) {
+  const { id, params } = msg;
+  const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
+
+  metrics.requestCount++;
+  if (result?.token) {
+    metrics.successCount++;
+  } else {
+    metrics.failedCount++;
+    metrics.lastError = result?.error || 'NO_TOKEN';
+  }
+  chrome.storage.local.set({ metrics });
+
+  await sendToAgent({ id, result });
+}
+
+// ─── Лог запросов ───────────────────────────────────────────
+
 const _VISIBLE_TYPES = new Set(['GEN_IMG', 'GEN_VID', 'GEN_VID_REF', 'UPSCALE', 'TRACKING', 'URL_REFRESH']);
 
 function _classifyApiUrl(url) {
@@ -40,19 +510,22 @@ function _classifyApiUrl(url) {
   return 'API';
 }
 
-// ─── Request Log ────────────────────────────────────────────
-
-let requestLog = [];
+function persistRequestLog() {
+  // Иначе после каждой перезагрузки воркера лог в попапе оказывался пустым
+  chrome.storage.local.set({ requestLog: requestLog.slice(0, 50) }).catch(() => {});
+}
 
 function addRequestLog(entry) {
   requestLog.unshift(entry);
   if (requestLog.length > 100) requestLog.pop();
+  persistRequestLog();
   broadcastRequestLog();
 }
 
 function updateRequestLog(id, updates) {
   const entry = requestLog.find((e) => e.id === id);
   if (entry) Object.assign(entry, updates);
+  persistRequestLog();
   broadcastRequestLog();
 }
 
@@ -60,398 +533,22 @@ function broadcastRequestLog() {
   chrome.runtime.sendMessage({ type: 'REQUEST_LOG_UPDATE', log: requestLog }).catch(() => {});
 }
 
-// ─── Startup ────────────────────────────────────────────────
-
-chrome.runtime.onInstalled.addListener(init);
-chrome.runtime.onStartup.addListener(init);
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === 'reconnect') connectToAgent();
-  if (alarm.name === 'keepAlive') keepAlive();
-  if (alarm.name === 'token-refresh') {
-    await captureTokenFromFlowTab();
-  }
-});
-
-// ─── Persistent Port from Content Script ────────────────────
-// Пока этот порт открыт — Android не может убить Service Worker.
-// Content script на вкладке Google Labs поддерживает этот порт живым.
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'tab-keepalive') return;
-  console.log('[Flow] Tab keepalive port connected — SW is locked alive');
-
-  port.onMessage.addListener((msg) => {
-    // Получили пинг от content script — переподключаемся к агенту если нужно
-    if (msg.type === 'ping' && (!ws || ws.readyState !== WebSocket.OPEN)) {
-      connectToAgent();
-    }
-  });
-
-  port.onDisconnect.addListener(() => {
-    console.log('[Flow] Tab keepalive port disconnected');
-  });
-});
-
-async function init() {
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret']);
-  if (data.flowKey) flowKey = data.flowKey;
-  if (data.metrics) Object.assign(metrics, data.metrics);
-  if (data.callbackSecret) callbackSecret = data.callbackSecret;
-  connectToAgent();
-  chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
-  startWebLockKeepalive();
-  startFetchKeepalive();
-  ensureOffscreenDocument();
-}
-
-// ─── Token Capture ──────────────────────────────────────────
-
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {
-    if (!details?.requestHeaders?.length) return;
-    const authHeader = details.requestHeaders.find(
-      (h) => h.name?.toLowerCase() === 'authorization',
-    );
-    const value = authHeader?.value || '';
-    if (!value.startsWith('Bearer ya29.')) return;
-
-    const token = value.replace(/^Bearer\s+/i, '').trim();
-    if (!token) return;
-
-    // Always update — even if same token string, refresh the timestamp
-    flowKey = token;
-    metrics.tokenCapturedAt = Date.now();
-    chrome.storage.local.set({ flowKey, metrics });
-    console.log('[FlowAgent] Bearer token captured');
-
-    // Notify agent
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-    }
-  },
-  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
-  ['requestHeaders', 'extraHeaders'],
-);
-
-let _openingFlowTab = false;
-
-async function captureTokenFromFlowTab() {
-  const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-  });
-  if (!tabs.length) {
-    if (_openingFlowTab) {
-      console.log('[FlowAgent] Flow tab already opening, skipping');
-      return;
-    }
-    _openingFlowTab = true;
-    try {
-      console.log('[FlowAgent] No Flow tab found — opening one in background');
-      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
-      await sleep(3000);
-      const retryTabs = await chrome.tabs.query({
-        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-      });
-      if (!retryTabs.length) {
-        console.log('[FlowAgent] Flow tab not ready yet after open');
-        return;
-      }
-      await chrome.scripting.executeScript({
-        target: { tabId: retryTabs[0].id },
-        files: ['content.js'],
-      });
-      console.log('[FlowAgent] Token refresh triggered on newly opened Flow tab');
-    } catch (e) {
-      console.error('[FlowAgent] Token refresh failed after opening tab:', e);
-    } finally {
-      _openingFlowTab = false;
-    }
-    return;
-  }
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tabs[0].id },
-      files: ['content.js'],
-    });
-    console.log('[FlowAgent] Token refresh triggered on Flow tab');
-  } catch (e) {
-    console.error('[FlowAgent] Token refresh failed:', e);
-  }
-}
-
-// ─── WebSocket to Agent ─────────────────────────────────────
-
-function connectToAgent() {
-  if (manualDisconnect) return;
-  if (ws?.readyState === WebSocket.CONNECTING) return;
-  if (ws?.readyState === WebSocket.OPEN) return;
-
-  try {
-    ws = new WebSocket(AGENT_WS_URL);
-  } catch (e) {
-    console.error('[FlowAgent] WS connect error:', e);
-    scheduleReconnect();
-    return;
-  }
-
-  ws.onopen = () => {
-    console.log('[FlowAgent] Connected to agent');
-    chrome.alarms.clear('reconnect');
-    setState('idle');
-
-    // Token refresh alarm — 45 min gives buffer before ~60 min expiry
-    chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
-
-    // Send current state + resend token if we have one
-    ws.send(JSON.stringify({
-      type: 'extension_ready',
-      flowKeyPresent: !!flowKey,
-      tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
-    }));
-    if (flowKey) {
-      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-    }
-  };
-
-  ws.onmessage = async ({ data }) => {
-    try {
-      const msg = JSON.parse(data);
-
-      if (msg.method === 'api_request') {
-        await handleApiRequest(msg);
-      } else if (msg.method === 'trpc_request') {
-        await handleTrpcRequest(msg);
-      } else if (msg.method === 'solve_captcha') {
-        await handleSolveCaptcha(msg);
-      } else if (msg.method === 'get_status') {
-        sendToAgent({
-          id: msg.id,
-          result: {
-            state,
-            flowKeyPresent: !!flowKey,
-            manualDisconnect,
-            tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
-            metrics,
-          },
-        });
-      } else if (msg.type === 'callback_secret') {
-        callbackSecret = msg.secret;
-        chrome.storage.local.set({ callbackSecret: msg.secret });
-        console.log('[FlowAgent] Received callback secret');
-      } else if (msg.type === 'pong') {
-        // keepalive response
-      }
-    } catch (e) {
-      console.error('[FlowAgent] Message error:', e);
-    }
-  };
-
-  ws.onclose = () => {
-    setState('off');
-    chrome.alarms.clear('token-refresh');
-    if (!manualDisconnect) scheduleReconnect();
-  };
-
-  ws.onerror = (e) => {
-    console.error('[FlowAgent] WS error:', e);
-    metrics.lastError = 'WS_ERROR';
-    chrome.storage.local.set({ metrics });
-  };
-}
-
-function scheduleReconnect() {
-  chrome.alarms.create('reconnect', { delayInMinutes: 0.083 }); // ~5s
-}
-
-function keepAlive() {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'ping' }));
-  } else {
-    connectToAgent();
-  }
-}
-
-// ─── Web Lock Keepalive (Android Anti-Kill) ──────────────
-// navigator.locks.request удерживает Service Worker живым пока лок активен.
-// Android не может убить SW с активным Web Lock.
-function startWebLockKeepalive() {
-  if (typeof navigator === 'undefined' || !navigator.locks) {
-    console.warn('[Flow] Web Locks API not available, skipping');
-    return;
-  }
-  // Берём shared lock с бесконечным промисом — SW остаётся живым
-  navigator.locks.request('flow-keepalive', { mode: 'shared' }, () => {
-    console.log('[Flow] Web Lock acquired — SW will stay alive');
-    return new Promise(() => {}); // никогда не резолвится
-  });
-}
-
-// ─── Offscreen Document (Android Anti-Kill Layer 2) ──────
-// Offscreen document живёт дольше SW и периодически его будит.
-let _offscreenCreating = false;
-
-async function ensureOffscreenDocument() {
-  if (!chrome.offscreen) {
-    console.warn('[Flow] chrome.offscreen API not supported in this browser, skipping Layer 2 keepalive');
-    return;
-  }
-  // Проверяем существующие offscreen документы
-  const existing = await chrome.offscreen.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).catch(() => []);
-  if (existing.length > 0) return;
-  if (_offscreenCreating) return;
-  _offscreenCreating = true;
-  try {
-    await chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['BLOBS'],
-      justification: 'Keep Service Worker alive on Android via periodic ping',
-    });
-    console.log('[Flow] Offscreen document created');
-  } catch (e) {
-    console.warn('[Flow] Could not create offscreen document:', e.message);
-  } finally {
-    _offscreenCreating = false;
-  }
-}
-
-// ─── Fetch-based Keepalive (legacy, kept as 3rd layer) ───
-// Делаем fetch с уменьшенным интервалом прямо из SW как дополнительный слой.
-let _fetchKeepaliveTimer = null;
-
-function startFetchKeepalive() {
-  if (_fetchKeepaliveTimer) return;
-  _fetchKeepaliveTimer = setInterval(async () => {
-    try {
-      await fetch('http://127.0.0.1:8001/health', { method: 'GET', cache: 'no-store' });
-    } catch {
-      // Server not running yet — ignore, SW still woke up
-    }
-  }, 20000); // every 20 seconds
-}
-
-function sendToAgent(msg) {
-  // API responses (with msg.id) go via HTTP — immune to WS disconnect
-  if (msg.id) {
-    fetch('http://127.0.0.1:8100/api/ext/callback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(msg),
-    }).catch(() => {
-      // HTTP failed — fallback to WS
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-    });
-    return;
-  }
-  // Non-response messages (ping, status) or no secret yet — use WS
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
-}
-
-// ─── reCAPTCHA Solving ──────────────────────────────────────
-
-async function requestCaptchaFromTab(tabId, requestId, pageAction) {
-  try {
-    return await chrome.tabs.sendMessage(tabId, {
-      type: 'GET_CAPTCHA',
-      requestId,
-      pageAction,
-    });
-  } catch (error) {
-    const msg = error?.message || '';
-    const shouldInject =
-      msg.includes('Receiving end does not exist') ||
-      msg.includes('Could not establish connection');
-    if (!shouldInject) throw error;
-
-    // Inject content script and retry
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content.js'],
-    });
-    await sleep(200);
-    return await chrome.tabs.sendMessage(tabId, {
-      type: 'GET_CAPTCHA',
-      requestId,
-      pageAction,
-    });
-  }
-}
-
-async function solveCaptcha(requestId, captchaAction) {
-  const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-  });
-
-  if (!tabs.length) {
-    // Auto-open Flow tab and wait briefly before returning error
-    try {
-      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
-      await sleep(3000);
-      // Retry tab query after opening
-      const retryTabs = await chrome.tabs.query({
-        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-      });
-      if (!retryTabs.length) return { error: 'NO_FLOW_TAB' };
-      const resp = await Promise.race([
-        requestCaptchaFromTab(retryTabs[0].id, requestId, captchaAction),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 5000)),
-      ]);
-      return resp;
-    } catch (e) {
-      return { error: e.message || 'NO_FLOW_TAB' };
-    }
-  }
-
-  try {
-    const resp = await Promise.race([
-      requestCaptchaFromTab(tabs[0].id, requestId, captchaAction),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 5000)),
-    ]);
-    return resp;
-  } catch (e) {
-    return { error: e.message };
-  }
-}
-
-async function handleSolveCaptcha(msg) {
-  const { id, params } = msg;
-  const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
-
-  // Standalone captcha solve counts as captcha-consuming
-  metrics.requestCount++;
-  if (result?.token) {
-    metrics.successCount++;
-  } else {
-    metrics.failedCount++;
-    metrics.lastError = result?.error || 'NO_TOKEN';
-  }
-  chrome.storage.local.set({ metrics });
-
-  sendToAgent({ id, result });
-}
-
-// ─── API Request Proxy ──────────────────────────────────────
+// ─── Прокси запросов ────────────────────────────────────────
 
 async function handleTrpcRequest(msg) {
   const { id, params } = msg;
   const { url, method = 'POST', headers = {}, body } = params;
 
   if (!url || !url.startsWith('https://labs.google/')) {
-    sendToAgent({ id, error: 'INVALID_TRPC_URL' });
+    await sendToAgent({ id, error: 'INVALID_TRPC_URL' });
     return;
   }
 
   setState('running');
-  // TRPC calls don't consume captcha — don't count in metrics
-
-  const logId = id;
-  const logType = url.includes('createProject') ? 'CREATE_PROJECT' : 'TRPC';
-  // TRPC calls are silent — don't show in request log
 
   const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
-  if (flowKey) {
-    fetchHeaders['authorization'] = `Bearer ${flowKey}`;
-  }
+  const key = await getFlowKey();
+  if (key) fetchHeaders['authorization'] = `Bearer ${key}`;
 
   try {
     const resp = await fetch(url, {
@@ -461,14 +558,10 @@ async function handleTrpcRequest(msg) {
       credentials: 'include',
     });
     const data = await resp.json();
-    chrome.storage.local.set({ metrics });
-    updateRequestLog(logId, { status: 'success' });
-    sendToAgent({ id, status: resp.status, data });
+    await sendToAgent({ id, status: resp.status, data });
   } catch (e) {
-    console.error('[FlowAgent] tRPC request failed:', e);
-    chrome.storage.local.set({ metrics });
-    updateRequestLog(logId, { status: 'failed', error: e.message || 'TRPC_FETCH_FAILED' });
-    sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+    console.error('[Flow] tRPC запрос не прошёл:', e);
+    await sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
   } finally {
     setState('idle');
   }
@@ -479,12 +572,11 @@ async function handleApiRequest(msg) {
   const { url, method, headers, body, captchaAction } = params;
 
   if (!url) {
-    sendToAgent({ id, error: 'MISSING_URL' });
+    await sendToAgent({ id, error: 'MISSING_URL' });
     return;
   }
-
   if (!url.startsWith('https://aisandbox-pa.googleapis.com/')) {
-    sendToAgent({ id, error: 'INVALID_URL' });
+    await sendToAgent({ id, error: 'INVALID_URL' });
     return;
   }
 
@@ -499,33 +591,39 @@ async function handleApiRequest(msg) {
     addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null, url, payloadSummary });
   }
 
+  const fail = async (status, error) => {
+    await sendToAgent({ id, status, error });
+    if (hasCaptcha) { metrics.failedCount++; metrics.lastError = error; }
+    chrome.storage.local.set({ metrics });
+    updateRequestLog(logId, { status: 'failed', error });
+    setState('idle');
+  };
+
   try {
-    // Step 1: Solve captcha if needed
+    // Шаг 1: токен reCAPTCHA (невидимая, никакого челленджа тут нет —
+    // страница Labs просто выдаёт токен, как делает и для самой себя)
     let captchaToken = null;
+    let captchaSource = null;
     if (captchaAction) {
       const captchaResult = await solveCaptcha(id, captchaAction);
       captchaToken = captchaResult?.token || null;
+      captchaSource = captchaResult?.source || null;
       if (!captchaToken) {
-        // Cannot proceed without captcha — API will 403
         const err = captchaResult?.error || 'CAPTCHA_FAILED';
-        console.error(`[FlowAgent] Captcha failed for ${captchaAction}: ${err}`);
-        sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
-        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
-        chrome.storage.local.set({ metrics });
-        updateRequestLog(logId, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
-        setState('idle');
+        console.error(`[Flow] Не получен токен reCAPTCHA для ${captchaAction}: ${err}`);
+        await fail(403, `CAPTCHA_FAILED: ${err}`);
         return;
       }
     }
 
-    // Step 2: Inject captcha token into body
+    // Шаг 2: вставляем токен капчи в тело
     let finalBody = body;
     if (captchaToken && finalBody) {
-      finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
+      finalBody = JSON.parse(JSON.stringify(finalBody));
       if (finalBody.clientContext?.recaptchaContext) {
         finalBody.clientContext.recaptchaContext.token = captchaToken;
       }
-      if (finalBody.requests && Array.isArray(finalBody.requests)) {
+      if (Array.isArray(finalBody.requests)) {
         for (const req of finalBody.requests) {
           if (req.clientContext?.recaptchaContext) {
             req.clientContext.recaptchaContext.token = captchaToken;
@@ -534,27 +632,35 @@ async function handleApiRequest(msg) {
       }
     }
 
-    // Step 3: Use flowKey for auth
-    const activeFlowKey = flowKey;
+    // Шаг 3: авторизация
+    let activeFlowKey = await getFlowKey();
     if (!activeFlowKey) {
-      sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
-      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
-      chrome.storage.local.set({ metrics });
-      updateRequestLog(logId, { status: 'failed', error: 'NO_FLOW_KEY' });
-      setState('idle');
+      console.log('[Flow] Токена нет — пробуем добыть');
+      await refreshToken();
+      activeFlowKey = await getFlowKey();
+    }
+    if (!activeFlowKey) {
+      await fail(503, 'NO_FLOW_KEY');
       return;
     }
 
-    const fetchHeaders = { ...(headers || {}) };
-    fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
-
-    // Step 4: Make the API call from browser context
-    const response = await fetch(url, {
+    // Шаг 4: сам запрос, с одной повторной попыткой на протухший токен
+    const doFetch = async (key) => fetch(url, {
       method: method || 'POST',
-      headers: fetchHeaders,
+      headers: { ...(headers || {}), authorization: `Bearer ${key}` },
       credentials: 'include',
       body: method === 'GET' ? undefined : JSON.stringify(finalBody),
     });
+
+    let response = await doFetch(activeFlowKey);
+
+    if (response.status === 401) {
+      console.log('[Flow] Токен протух (401) — обновляем и пробуем ещё раз');
+      if (await refreshToken()) {
+        const fresh = await getFlowKey();
+        if (fresh) response = await doFetch(fresh);
+      }
+    }
 
     let responseData;
     const responseText = await response.text();
@@ -564,11 +670,9 @@ async function handleApiRequest(msg) {
       responseData = responseText;
     }
 
-    sendToAgent({
-      id,
-      status: response.status,
-      data: responseData,
-    });
+    // captchaSource нужен серверу, чтобы при 403 сразу было видно,
+    // откуда пришёл токен — на телефоне консоль расширения недоступна.
+    await sendToAgent({ id, status: response.status, data: responseData, captchaSource });
 
     const responseSummary = responseText ? responseText.slice(0, 300) : null;
     if (response.ok) {
@@ -579,11 +683,7 @@ async function handleApiRequest(msg) {
       updateRequestLog(logId, { status: 'failed', error: `API_${response.status}`, httpStatus: response.status, responseSummary });
     }
   } catch (e) {
-    sendToAgent({
-      id,
-      status: 500,
-      error: e.message || 'API_REQUEST_FAILED',
-    });
+    await sendToAgent({ id, status: 500, error: e.message || 'API_REQUEST_FAILED' });
     if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message; }
     updateRequestLog(logId, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
   }
@@ -592,67 +692,92 @@ async function handleApiRequest(msg) {
   setState('idle');
 }
 
-// ─── State & Popup ──────────────────────────────────────────
+// ─── Offscreen (дополнительный слой пробуждения) ────────────
+
+let _offscreenCreating = false;
+
+async function ensureOffscreenDocument() {
+  if (!chrome.offscreen) return; // мобильные сборки часто без этого API
+  try {
+    const existing = await chrome.offscreen.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).catch(() => []);
+    if (existing.length > 0 || _offscreenCreating) return;
+    _offscreenCreating = true;
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['BLOBS'],
+      justification: 'Периодически будит Service Worker на Android',
+    });
+    console.log('[Flow] Offscreen-документ создан');
+  } catch (e) {
+    console.warn('[Flow] Offscreen недоступен:', e.message);
+  } finally {
+    _offscreenCreating = false;
+  }
+}
+
+// ─── Состояние и попап ──────────────────────────────────────
 
 function setState(newState) {
   state = newState;
   const badges = { idle: '●', running: '▶', off: '○' };
   const colors = { idle: '#22c55e', running: '#f59e0b', off: '#6b7280' };
-  chrome.action.setBadgeText({ text: badges[state] || '' });
-  chrome.action.setBadgeBackgroundColor({ color: colors[state] || '#000' });
-  broadcastStatus();
-}
-
-function broadcastStatus() {
+  try {
+    chrome.action.setBadgeText({ text: badges[state] || '' });
+    chrome.action.setBadgeBackgroundColor({ color: colors[state] || '#000' });
+  } catch {}
   chrome.runtime.sendMessage({ type: 'STATUS_PUSH' }).catch(() => {});
 }
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === 'STATUS') {
-    reply({
-      connected: ws?.readyState === WebSocket.OPEN,
-      agentConnected: ws?.readyState === WebSocket.OPEN,
-      flowKeyPresent: !!flowKey,
-      manualDisconnect,
-      tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
-      metrics: {
-        requestCount: metrics.requestCount,
-        successCount: metrics.successCount,
-        failedCount: metrics.failedCount,
-        lastError: metrics.lastError,
-      },
-      state,
+    ensureInit().then(async () => {
+      await getFlowKey();
+      reply({
+        connected: state !== 'off',
+        agentConnected: state !== 'off',
+        flowKeyPresent: !!flowKey,
+        manualDisconnect,
+        tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+        metrics: {
+          requestCount: metrics.requestCount,
+          successCount: metrics.successCount,
+          failedCount: metrics.failedCount,
+          lastError: metrics.lastError,
+        },
+        state,
+      });
     });
+    return true;
   }
 
   if (msg.type === 'DISCONNECT') {
     manualDisconnect = true;
-    if (ws) ws.close();
+    chrome.storage.local.set({ manualDisconnect: true });
+    setState('off');
     reply({ ok: true });
     return true;
   }
 
   if (msg.type === 'RECONNECT') {
     manualDisconnect = false;
-    connectToAgent();
+    chrome.storage.local.set({ manualDisconnect: false });
+    ensureInit().then(startPolling);
     reply({ ok: true });
     return true;
   }
 
   if (msg.type === 'REQUEST_LOG') {
-    reply({ log: requestLog });
+    ensureInit().then(() => reply({ log: requestLog }));
     return true;
   }
 
   if (msg.type === 'OPEN_FLOW_TAB') {
-    chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-    }).then((tabs) => {
+    chrome.tabs.query({ url: FLOW_TAB_PATTERNS }).then((tabs) => {
       if (tabs.length) {
         chrome.tabs.update(tabs[0].id, { active: true });
         reply({ ok: true, tabId: tabs[0].id });
       } else {
-        chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow' })
+        chrome.tabs.create({ url: FLOW_URL })
           .then((tab) => reply({ ok: true, tabId: tab.id }))
           .catch((e) => reply({ error: e.message }));
       }
@@ -661,8 +786,9 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'REFRESH_TOKEN') {
-    captureTokenFromFlowTab()
-      .then(() => reply({ ok: true }))
+    ensureInit()
+      .then(refreshToken)
+      .then((ok) => reply({ ok }))
       .catch((e) => reply({ error: e.message }));
     return true;
   }
@@ -675,11 +801,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'OFFSCREEN_PING') {
-    // Offscreen document нас разбудил — переподключаемся к агенту если нужно
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      connectToAgent();
-    }
-    ensureOffscreenDocument(); // убедимся что offscreen жив
+    ensureInit().then(startPolling);
     return false;
   }
 
@@ -696,20 +818,16 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
 function handleTrpcMediaUrls(trpcUrl, bodyText) {
   try {
-    // Extract all fresh GCS signed URLs
     const urlRegex = /https:\/\/storage\.googleapis\.com\/ai-sandbox-videofx\/(?:image|video)\/[0-9a-f-]{36}\?[^"'\s]+/g;
     const matches = bodyText.match(urlRegex) || [];
     if (!matches.length) return;
 
-    // Deduplicate and parse
     const urlMap = {};
     for (const rawUrl of matches) {
-      // Unescape JSON-escaped URLs
       const url = rawUrl.replace(/\\u0026/g, '&').replace(/\\/g, '');
       const mediaMatch = url.match(/\/(image|video)\/([0-9a-f-]{36})\?/);
       if (mediaMatch) {
         const [, mediaType, mediaId] = mediaMatch;
-        // Keep last occurrence (freshest)
         urlMap[mediaId] = { mediaType, url, mediaId };
       }
     }
@@ -717,18 +835,10 @@ function handleTrpcMediaUrls(trpcUrl, bodyText) {
     const entries = Object.values(urlMap);
     if (!entries.length) return;
 
-    console.log(`[FlowAgent] Captured ${entries.length} fresh media URLs from TRPC`);
-    // URL refresh is silent — don't show in request log
-
-    // Forward to agent for DB update
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'media_urls_refresh',
-        urls: entries,
-      }));
-    }
+    console.log(`[Flow] Поймали ${entries.length} свежих media URL из TRPC`);
+    sendToAgent({ type: 'media_urls_refresh', urls: entries });
   } catch (e) {
-    console.error('[FlowAgent] Failed to extract TRPC media URLs:', e);
+    console.error('[Flow] Не смогли разобрать TRPC media URL:', e);
   }
 }
 
@@ -736,16 +846,26 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ─── Human-like Telemetry ──────────────────────────────────
-// Periodically send tracking events to Google's analytics endpoints
-// to mimic normal browser behavior.
+// ─── Телеметрия «как у живого пользователя» ────────────────
 
 const _UA = navigator.userAgent;
-let _telemetrySessionId = `;${Date.now()}`;
 
 function _rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
-function _buildBatchLogPayload() {
+async function _sessionId() {
+  const { telemetrySession } = await chrome.storage.local.get('telemetrySession');
+  const now = Date.now();
+  // Сессия живёт ~30 минут, как у настоящего пользователя. Раньше она лежала
+  // в памяти воркера и обнулялась при каждой его смерти.
+  if (telemetrySession && now - telemetrySession.created < 30 * 60 * 1000) {
+    return telemetrySession.id;
+  }
+  const id = `;${now}`;
+  await chrome.storage.local.set({ telemetrySession: { id, created: now } });
+  return id;
+}
+
+function _buildBatchLogPayload(sessionId) {
   const events = [];
   const types = ['FLOW_IMAGE_LATENCY', 'FLOW_VIDEO_LATENCY'];
   const count = _rand(1, 3);
@@ -758,14 +878,14 @@ function _buildBatchLogPayload() {
         { key: 'USER_AGENT', stringValue: _UA },
         { key: 'IS_DESKTOP', booleanValue: true },
       ],
-      eventMetadata: { sessionId: _telemetrySessionId },
+      eventMetadata: { sessionId },
       eventTime: new Date().toISOString(),
     });
   }
   return { appEvents: events };
 }
 
-function _buildFrontendEventsPayload() {
+function _buildFrontendEventsPayload(sessionId) {
   const eventTypes = [
     'FLOW_IMAGE_LATENCY', 'FLOW_VIDEO_LATENCY', 'GRID_SCROLL_DEPTH',
     'FLOW_PROJECT_OPEN', 'FLOW_SCENE_VIEW',
@@ -787,52 +907,35 @@ function _buildFrontendEventsPayload() {
     }
     events.push({
       eventType: et,
-      metadata: {
-        sessionId: _telemetrySessionId,
-        createTime: new Date().toISOString(),
-        additionalParams: params,
-      },
+      metadata: { sessionId, createTime: new Date().toISOString(), additionalParams: params },
     });
   }
   return { events };
 }
 
 async function sendTelemetry() {
-  if (!flowKey || state === 'off') return;
+  const key = await getFlowKey();
+  if (!key || state === 'off') return;
 
+  const sessionId = await _sessionId();
   const headers = {
     'Content-Type': 'text/plain;charset=UTF-8',
-    'authorization': `Bearer ${flowKey}`,
+    'authorization': `Bearer ${key}`,
   };
 
-  // Telemetry is silent — don't show in request log
   try {
     if (Math.random() < 0.5) {
-      await fetch(`https://aisandbox-pa.googleapis.com/v1:batchLog`, {
+      await fetch('https://aisandbox-pa.googleapis.com/v1:batchLog', {
         method: 'POST', headers, credentials: 'include',
-        body: JSON.stringify(_buildBatchLogPayload()),
+        body: JSON.stringify(_buildBatchLogPayload(sessionId)),
       });
     } else {
-      await fetch(`https://aisandbox-pa.googleapis.com/v1/flow:batchLogFrontendEvents`, {
+      await fetch('https://aisandbox-pa.googleapis.com/v1/flow:batchLogFrontendEvents', {
         method: 'POST', headers, credentials: 'include',
-        body: JSON.stringify(_buildFrontendEventsPayload()),
+        body: JSON.stringify(_buildFrontendEventsPayload(sessionId)),
       });
     }
   } catch {}
 }
 
-// Send telemetry at random intervals (45-120s) to look organic
-function scheduleTelemetry() {
-  const delay = _rand(45, 120) * 1000;
-  setTimeout(async () => {
-    await sendTelemetry();
-    scheduleTelemetry(); // reschedule with new random interval
-  }, delay);
-}
-
-// Refresh session ID every ~30min like a real user
-setInterval(() => { _telemetrySessionId = `;${Date.now()}`; }, _rand(25, 35) * 60 * 1000);
-
-scheduleTelemetry();
-
-console.log('[FlowAgent] Extension loaded');
+console.log('[Flow] Расширение загружено');
