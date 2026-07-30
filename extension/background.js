@@ -268,16 +268,24 @@ async function refreshToken() {
   const before = flowKeyCapturedAt || 0;
   const targets = await findCaptchaTargets();
 
-  if (!targets.length) {
-    const opened = await openFlowTab();
-    if (!opened) return false;
-  } else {
-    const t = targets[0];
+  // chrome.tabs.reload перезагружает ВКЛАДКУ целиком, а скрытый iframe Labs
+  // живёт внутри страницы SillyTavern. Раньше цель бралась первой попавшейся,
+  // и если настоящей вкладки Labs не было, у человека посреди генерации
+  // перезагружалась Таверна вместе с чатом. Вкладку трогаем, только если она
+  // сама и есть цель; фрейм обновляем изнутри, не задевая страницу вокруг.
+  const topLevel = targets.find((t) => t.frameId === 0);
+
+  if (topLevel) {
     try {
-      await chrome.tabs.reload(t.tabId);
+      await chrome.tabs.reload(topLevel.tabId);
     } catch {
       return false;
     }
+  } else if (targets.length) {
+    if (!(await reloadFrame(targets[0]))) return false;
+  } else {
+    const opened = await openFlowTab();
+    if (!opened) return false;
   }
 
   const deadline = Date.now() + TOKEN_REFRESH_WAIT_MS;
@@ -346,7 +354,21 @@ async function findCaptchaTargets() {
   return targets;
 }
 
-async function wakeTab(tabId) {
+// Обновляет один фрейм, не трогая страницу, в которой он живёт.
+async function reloadFrame({ tabId, frameId }) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      func: () => location.reload(),
+    });
+    return true;
+  } catch (e) {
+    console.warn(`[Flow] Не смогли обновить фрейм ${tabId}:${frameId} — ${e?.message || e}`);
+    return false;
+  }
+}
+
+async function wakeTab({ tabId, frameId }) {
   let tab;
   try {
     tab = await chrome.tabs.get(tabId);
@@ -356,6 +378,13 @@ async function wakeTab(tabId) {
   // Android выгружает фоновые вкладки: скрипт в них не отвечает,
   // пока вкладку не перезагрузить.
   if (tab.discarded || tab.status === 'unloaded') {
+    // Выгруженная вкладка со скрытым iframe — это почти всегда SillyTavern.
+    // Перезагрузить её значит увести человека с чата, поэтому просто
+    // пропускаем эту цель: следующей в списке идёт настоящая вкладка Labs.
+    if (frameId !== 0) {
+      console.log(`[Flow] Вкладка ${tabId} со скрытым iframe выгружена — не трогаем её`);
+      return false;
+    }
     console.log(`[Flow] Вкладка ${tabId} была выгружена системой — поднимаем`);
     try {
       await chrome.tabs.reload(tabId);
@@ -461,7 +490,7 @@ async function solveCaptcha(requestId, captchaAction) {
   let lastError = 'CAPTCHA_FAILED';
   for (const target of targets.slice(0, 3)) {
     try {
-      if (!(await wakeTab(target.tabId))) continue;
+      if (!(await wakeTab(target))) continue;
       const resp = await withTimeout(
         requestCaptchaFromFrame(target, requestId, captchaAction),
         CAPTCHA_TIMEOUT_MS,
