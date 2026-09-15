@@ -16,8 +16,7 @@
     "activeTab"
   ],
   "host_permissions": [
-    "https://labs.google/*",
-    "https://aisandbox-pa.googleapis.com/*",
+    "https://flow.google.com/*",
     "http://127.0.0.1:8001/*",
     "http://localhost:8001/*"
   ],
@@ -27,8 +26,7 @@
   "content_scripts": [
     {
       "matches": [
-        "https://labs.google/fx/tools/flow*",
-        "https://labs.google/fx/*/tools/flow*"
+        "https://flow.google.com/*"
       ],
       "js": [
         "keepalive.js",
@@ -57,7 +55,7 @@
         "offscreen.js"
       ],
       "matches": [
-        "https://labs.google/*",
+        "https://flow.google.com/*",
         "<all_urls>"
       ]
     }

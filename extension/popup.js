@@ -137,7 +137,7 @@ document.getElementById('btn-embed').addEventListener('click', () => {
     if (tabs[0]) {
       chrome.scripting.executeScript({
         target: { tabId: tabs[0].id },
-        files: ['st_injector.js']
+        files: ['keepalive.js', 'st_injector.js']
       }).then(() => {
         console.log("Injected st_injector.js");
       }).catch((err) => {

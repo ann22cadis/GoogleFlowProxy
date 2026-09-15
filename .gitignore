@@ -1,6 +1,8 @@
 active_project.json
+proxy_key.txt
 old_*.py
 *.zip
 __pycache__/
 *.pyc
 extension/_metadata/
+.claude/

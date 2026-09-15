@@ -1,9 +1,9 @@
 /**
- * Content script на labs.google — мост между background.js и injected.js.
+ * Content script на flow.google.com — мост между background.js и injected.js.
  * Работает во ВСЕХ фреймах, включая скрытый iframe, который st_injector.js
  * вставляет во вкладку SillyTavern: капчу умеет выдавать любой фрейм
- * с origin labs.google, и такой iframe переживает Android гораздо лучше,
- * чем отдельная вкладка Labs.
+ * с origin flow.google.com, и такой iframe переживает Android гораздо лучше,
+ * чем отдельная вкладка Flow.
  */
 
 // Скрипт может быть внедрён повторно через chrome.scripting — не дублируем слушателей
@@ -43,11 +43,29 @@ if (!window.__flowContentLoaded) {
     return true; // держим канал открытым для асинхронного ответа
   });
 
-  // ─── TRPC Media URL Monitor ───────────────────────────────
-  window.addEventListener('TRPC_MEDIA_URLS', (e) => {
-    const { url, body } = e.detail || {};
-    if (!body) return;
-    chrome.runtime.sendMessage({ type: 'TRPC_MEDIA_URLS', trpcUrl: url, body }).catch(() => {});
+  chrome.runtime.onMessage.addListener((msg, _, reply) => {
+    if (msg.type !== 'FLOW_FETCH') return;
+
+    const { requestId, url, body, headers } = msg;
+
+    const handler = (e) => {
+      if (e.detail?.requestId === requestId) {
+        window.removeEventListener('FLOW_FETCH_RESULT', handler);
+        clearTimeout(timer);
+        reply({ status: e.detail.status, text: e.detail.text, error: e.detail.error });
+      }
+    };
+
+    // Чуть короче FETCH_TIMEOUT_MS в background.js, чтобы фон получил внятную ошибку
+    const timer = setTimeout(() => {
+      window.removeEventListener('FLOW_FETCH_RESULT', handler);
+      reply({ error: 'CONTENT_TIMEOUT' });
+    }, 55000);
+
+    window.addEventListener('FLOW_FETCH_RESULT', handler);
+    window.dispatchEvent(new CustomEvent('FLOW_FETCH', { detail: { requestId, url, body, headers } }));
+
+    return true; // держим канал открытым для асинхронного ответа
   });
 
   // ─── Порт до Service Worker ───────────────────────────────

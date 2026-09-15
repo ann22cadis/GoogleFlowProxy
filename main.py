@@ -1,5 +1,10 @@
 import asyncio
+import hashlib
+import inspect
 import json
+import os
+import secrets
+import sys
 import uuid
 import re
 import time
@@ -8,13 +13,14 @@ import base64
 import urllib.request
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 class NoiseFilter(logging.Filter):
-    """Служебные эндпоинты опрашиваются постоянно — не засоряем консоль."""
-    QUIET = ("GET /health", "GET /api/ext/poll", "POST /api/ext/callback")
+    """Служебные запросы не засоряют консоль. Итог генерации пишет сам generate_content."""
+    QUIET = ("GET /health", "GET /api/ext/poll", "POST /api/ext/callback",
+             "OPTIONS ", "generateContent HTTP")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -32,16 +38,191 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
+_cors_options = dict(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Новые версии Starlette сами отклоняют запрос к 127.0.0.1 с публичного сайта
+# (таверна на хостинге), пока это явно не разрешено. В старых такого
+# параметра нет — там заголовок ставит local_guard ниже.
+if "allow_private_network" in inspect.signature(CORSMiddleware.__init__).parameters:
+    _cors_options["allow_private_network"] = True
+app.add_middleware(CORSMiddleware, **_cors_options)
 
-GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
-GOOGLE_API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY"
+EXTENSION_ORIGINS = ("chrome-extension://", "moz-extension://")
+
+
+@app.middleware("http")
+async def local_guard(request: Request, call_next):
+    # sillyimages ходит к прокси прямо из браузера, поэтому CORS открыт. Но
+    # тогда и любой открытый сайт мог бы читать /api/ext/poll — промпты и
+    # референсы из очереди. Расширение приходит со своим origin или без него,
+    # а обычная страница всегда присылает свой.
+    if request.url.path.startswith("/api/ext/"):
+        origin = request.headers.get("origin")
+        if origin and not origin.startswith(EXTENSION_ORIGINS):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    response = await call_next(request)
+
+    # Chromium спрашивает явное разрешение, когда сайт с чужого сервера
+    # (например, таверна на хостинге) обращается к 127.0.0.1
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
+# ─── Ключ доступа к прокси ────────────────────────────────────
+# Работает как пароль: без него любой сайт, открытый в том же браузере, мог
+# бы генерировать картинки на вашем аккаунте Google.
+
+KEY_FILE = "proxy_key.txt"
+MIN_KEY_LENGTH = 12
+
+
+def load_proxy_key() -> str | None:
+    key = os.environ.get("FLOW_PROXY_KEY", "").strip()
+    if key:
+        return key
+    try:
+        with open(KEY_FILE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def ask_proxy_key() -> str | None:
+    """Первый запуск: просим придумать ключ. Без терминала (pm2 и т.п.) не спрашиваем."""
+    if not sys.stdin.isatty():
+        return None
+    print("\n[КЛЮЧ] Придумайте ключ доступа к прокси — он работает как пароль.")
+    print("[КЛЮЧ] Его нужно будет вписать в SillyTavern в поле «API ключ».")
+    entered = input("[КЛЮЧ] Ваш ключ (Enter — сгенерировать случайный): ").strip()
+    key = entered or secrets.token_urlsafe(24)
+    with open(KEY_FILE, "w", encoding="utf-8") as f:
+        f.write(key)
+    print(f"[КЛЮЧ] Сохранён в {KEY_FILE}: {key}\n")
+    return key
+
+
+PROXY_KEY = load_proxy_key()
+
+
+def check_proxy_key(request: Request) -> JSONResponse | None:
+    """None — ключ подходит (или не задан), иначе готовый ответ 401."""
+    if not PROXY_KEY:
+        return None
+    auth = request.headers.get("authorization", "")
+    provided = (
+        request.headers.get("x-goog-api-key")
+        or (auth[7:] if auth.lower().startswith("bearer ") else "")
+        or request.query_params.get("key")
+        or ""
+    ).strip()
+    if secrets.compare_digest(provided.encode(), PROXY_KEY.encode()):
+        return None
+    print("[КЛЮЧ] Отклонён запрос с неверным ключом")
+    return JSONResponse({"error": {
+        "code": 401,
+        "status": "UNAUTHENTICATED",
+        "message": f"Неверный ключ прокси Flow. Впишите в SillyTavern ключ из {KEY_FILE}.",
+    }}, status_code=401)
+
+# ─────────────────────────────────────────────────────────────
+#  Google переехал с labs.google/fx/tools/flow на flow.google.com и сменил
+#  протокол: вместо обычного REST JSON (aisandbox-pa.googleapis.com) теперь
+#  используется batchexecute — тот же RPC-протокол, что у Docs/Photos/Bard.
+#
+#  Тело запроса — не JSON, а form-urlencoded с полями f.req (вложенный
+#  JSON-массив вида [[[rpcid, "аргументы-строкой", null, "generic"]]]) и at
+#  (анти-CSRF токен страницы). Ответ — тоже не чистый JSON: префикс )]}',
+#  затем чанки вида "<длина>\n<JSON-массив>".
+#
+#  Авторизация больше не через Bearer-токен (капture из заголовков), а через
+#  обычные cookies сессии Google — поэтому сам fetch должен выполняться
+#  ИЗ КОНТЕКСТА страницы flow.google.com (расширение делает это через
+#  injected.js), а не напрямую из background.js расширения. URL и тело
+#  batchexecute-запроса поэтому собирает само расширение (background.js) —
+#  оно же знает актуальные bl/f.sid/at, пойманные из трафика страницы;
+#  main.py передаёт только rpcid и аргументы вызова.
+# ─────────────────────────────────────────────────────────────
+
+# Внутренние ID RPC-вызовов Google Flow (найдены разбором HAR-лога реальной сессии)
+RPC_CREATE_PROJECT = "jHPbke"
+RPC_GENERATE_IMAGE = "ogiZ0b"
+RPC_UPLOAD_IMAGE = "maseQ"
+RPC_UPSCALE_IMAGE = "SPrCad"
+
+CAPTCHA_PLACEHOLDER = "__CAPTCHA__"
+
+
+def parse_batchexecute_response(text: str, rpcid: str):
+    """
+    Разбирает чанкованный ответ batchexecute.
+
+    Формат: )]}'\\n\\n<длина>\\n<JSON-массив>\\n<длина>\\n<JSON-массив>...
+    Каждый JSON-массив — это либо содержательный чанк вида
+    ["wrb.fr", rpcid, "<JSON-строка-с-результатом>", ...], либо служебный
+    (["di", ...], ["e", ...], ["af.httprm", ...]) — их пропускаем.
+    """
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.isdigit():
+            i += 1
+            if i >= len(lines):
+                break
+            try:
+                chunk = json.loads(lines[i])
+            except Exception:
+                i += 1
+                continue
+            for entry in chunk:
+                if isinstance(entry, list) and len(entry) >= 3 and entry[0] == "wrb.fr" and entry[1] == rpcid:
+                    return json.loads(entry[2])
+        i += 1
+    raise ValueError(f"Не нашли wrb.fr для {rpcid} в ответе batchexecute")
+
+
+def _find_string_containing(obj, needle: str):
+    """Рекурсивно ищет первую строку, содержащую needle, в произвольно вложенной структуре."""
+    if isinstance(obj, str):
+        return obj if needle in obj else None
+    if isinstance(obj, list):
+        for item in obj:
+            found = _find_string_containing(item, needle)
+            if found:
+                return found
+    return None
+
+
+async def batch_execute(rpcid: str, args, source_path: str, captcha_action: str = "", timeout: int = 180) -> dict:
+    """Отправляет один batchexecute RPC через расширение и разбирает ответ."""
+    body_str = json.dumps(args)
+    res = await send_to_extension("batch_execute", {
+        "rpcid": rpcid,
+        "argsJson": body_str,
+        "sourcePath": source_path,
+        "captchaAction": captcha_action,
+    }, timeout=timeout)
+
+    if res.get("error"):
+        return res
+
+    status = res.get("status")
+    if isinstance(status, int) and status >= 400:
+        return {"error": f"HTTP {status}: {str(res.get('data'))[:500]}", "status": status}
+
+    raw_text = res.get("data") or ""
+    try:
+        parsed = parse_batchexecute_response(raw_text, rpcid)
+    except Exception as e:
+        return {"error": f"Не смогли разобрать ответ Google: {e}"}
+
+    return {"result": parsed}
 
 # Храним project_id на диске, чтобы не создавать новые проекты при каждом рестарте
 PROJECT_FILE = "active_project.json"
@@ -60,8 +241,6 @@ PROJECT_FILE = "active_project.json"
 #  Если расширение умерло между выдачей задачи и ack — задача возвращается
 #  в очередь и уедет следующему поллеру. Ничего не теряется, SillyTavern
 #  просто ждёт чуть дольше вместо ошибки "расширение не подключено".
-#
-#  WebSocket оставлен как второй потребитель той же очереди (десктоп).
 # ─────────────────────────────────────────────────────────────
 
 POLL_WAIT_MAX = 25.0      # сколько держим long-poll открытым
@@ -79,7 +258,6 @@ class ExtensionBridge:
         self.acked: set[str] = set()
         self.attempts: dict[str, int] = {}
         self.last_seen = 0.0
-        self.ws: WebSocket | None = None
         self._online = False
 
     # ── состояние ────────────────────────────────────────────
@@ -132,8 +310,8 @@ class ExtensionBridge:
         self.attempts.pop(req_id, None)
         self.acked.discard(req_id)
 
-    # ── получение задачи потребителем (poll или ws) ──────────
-    async def take(self, wait: float, transport: str = "poll") -> dict | None:
+    # ── получение задачи расширением ─────────────────────────
+    async def take(self, wait: float) -> dict | None:
         deadline = time.monotonic() + wait
         while True:
             remaining = deadline - time.monotonic()
@@ -151,11 +329,6 @@ class ExtensionBridge:
 
             self.delivered[req_id] = time.time()
             self.attempts[req_id] = self.attempts.get(req_id, 0) + 1
-            if transport == "ws":
-                # Старые сборки расширения не умеют слать ack. Считаем задачу
-                # подтверждённой сразу, иначе watchdog выдал бы её повторно
-                # и картинка сгенерировалась бы дважды.
-                self.acked.add(req_id)
             return job
 
     # ── ответ от расширения ──────────────────────────────────
@@ -226,58 +399,36 @@ async def ext_callback(request: Request):
     return JSONResponse({"ok": True})
 
 
-# ─── WebSocket (второй потребитель той же очереди, для десктопа) ───
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    bridge.ws = websocket
-    bridge.touch("websocket")
-
-    async def pump_jobs():
-        """Забирает задачи из общей очереди и шлёт их в сокет."""
-        while True:
-            job = await bridge.take(POLL_WAIT_MAX, transport="ws")
-            if job is None:
-                continue
-            await websocket.send_text(json.dumps(job))
-
-    pump = asyncio.create_task(pump_jobs())
-    try:
-        while True:
-            data = await websocket.receive_text()
-            bridge.touch("websocket")
-            msg = json.loads(data)
-
-            if msg.get("type") == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-                continue
-
-            bridge.resolve(msg)
-    except Exception as e:
-        print(f"[WS] Отключено: {e}")
-    finally:
-        pump.cancel()
-        # ВАЖНО: обнуляем сокет, только если он всё ещё наш. Иначе при
-        # переподключении с телефона старый обработчик затирает новый.
-        if bridge.ws is websocket:
-            bridge.ws = None
-
-
 # ─── Загрузка / сохранение проекта ───────────────────────────
 
-def load_project_id():
+def load_project_state() -> dict:
     try:
         with open(PROJECT_FILE) as f:
-            return json.load(f).get("project_id")
-    except:
-        return None
+            return json.load(f)
+    except Exception:
+        return {}
 
-def save_project_id(pid):
+def save_project_state():
     with open(PROJECT_FILE, "w") as f:
-        json.dump({"project_id": pid}, f)
+        json.dump({
+            "project_id": active_project_id,
+            "refs_workflow_id": refs_workflow_id,
+            "refs_cache": refs_cache,
+        }, f)
 
-active_project_id = load_project_id()
+def forget_references():
+    """Плитку с референсами удалили — ни она, ни загруженные в неё картинки больше не действуют."""
+    global refs_workflow_id
+    refs_workflow_id = None
+    refs_cache.clear()
+    save_project_state()
+
+_project_state = load_project_state()
+active_project_id = _project_state.get("project_id")
+# Workflow (плитка в проекте), внутрь которого скрыто складываются референсы
+refs_workflow_id = _project_state.get("refs_workflow_id")
+# sha256 картинки -> mediaId: уже загруженный в этот проект референс не грузим заново
+refs_cache: dict[str, str] = _project_state.get("refs_cache") or {}
 if active_project_id:
     print(f"[API] Загрузили сохраненный проект: {active_project_id}")
 
@@ -288,42 +439,99 @@ async def send_to_extension(method: str, params: dict, timeout: int = 180) -> di
     return await bridge.call(method, params, timeout=timeout)
 
 
-async def upload_reference_image(image_base64: str, quiet: bool = False) -> str:
-    """Загружает картинку и возвращает mediaId."""
+async def upload_reference_image(image_base64: str, project_id: str, filename: str, quiet: bool = False) -> str:
+    """
+    Загружает референсную картинку (rpcid=maseQ) и возвращает её mediaId.
+
+    Каждая загрузка без workflowId заводит в проекте новую плитку, и флаг
+    isHidden это не отменяет: он скрывает картинку только внутри своего
+    workflow. Поэтому первый референс в проекте загружается обычным способом,
+    а все следующие — скрытыми внутрь его workflow, как сайт делает со своими
+    служебными загрузками. На весь проект остаётся одна плитка.
+    """
+    global refs_workflow_id
     if not quiet:
         print("[API] Загрузка референса...")
-    body = {
-        "clientContext": {"tool": "PINHOLE"},
-        "fileName": f"ref_{int(time.time())}.jpg",
-        "imageBytes": image_base64,
-        "isHidden": False,
-        "isUserUploaded": True,
-        "mimeType": "image/jpeg",
-    }
 
-    url = f"{GOOGLE_FLOW_API}/v1/flow/uploadImage?key={GOOGLE_API_KEY}"
-    res = await send_to_extension("api_request", {
-        "url": url,
-        "method": "POST",
-        "headers": {"content-type": "application/json"},
-        "body": body,
-        "captchaAction": ""
-    })
+    for attempt in range(2):
+        container = refs_workflow_id
+        # clientContext по коду сайта: 2 инструмент (22 = PINHOLE), 5 workflowId,
+        # 6 projectId, 11 reCAPTCHA
+        client_ctx = [None, 22, None, None, container, project_id, None, None, None, None, [CAPTCHA_PLACEHOLDER, 1]]
+        # UploadImage: 1 clientContext, 2 байты, 3 mimeType, 4 флаг (у сайта
+        # всегда true), 8 isHidden, 9 имя файла, 11/12 id
+        args = [client_ctx, image_base64, "image/jpeg", 1, None, None, None, 1 if container else None,
+                filename, None, str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()]
+
+        res = await batch_execute(
+            RPC_UPLOAD_IMAGE, args,
+            source_path=f"/project/{project_id}",
+            captcha_action="UPLOAD_IMAGE",
+        )
+
+        status = res.get("status")
+        rejected = (isinstance(status, int) and 400 <= status < 500) or "разобрать ответ" in str(res.get("error"))
+        if container and attempt == 0 and rejected:
+            # Скорее всего, плитку-контейнер удалили из проекта вручную
+            print("\n[API] Плитка для референсов недоступна — заводим новую")
+            forget_references()
+            continue
+        break
 
     if res.get("error"):
-        print(f"\n[API] Ошибка загрузки референса: {res['error']}")
+        err = res["error"]
+        print(f"\n[API] Ошибка загрузки референса: {with_explanation(err, describe_google_error(str(err)))}")
         return None
 
-    data = res.get("data", {})
-    if isinstance(data, dict):
-        media = data.get("media", {})
-        if isinstance(media, dict) and media.get("name"):
-            if not quiet:
-                print(f"[API] Референс загружен! mediaId: {media['name']}")
-            return media["name"]
+    try:
+        media_id = res["result"][0][0]
+    except Exception as e:
+        print(f"\n[API] Не удалось найти mediaId в ответе загрузки: {e}")
+        return None
 
-    print(f"\n[API] Не удалось найти mediaId в ответе загрузки.")
-    return None
+    if not container:
+        workflow_id = res["result"][0][2] if len(res["result"][0]) > 2 else None
+        if isinstance(workflow_id, str) and workflow_id:
+            refs_workflow_id = workflow_id
+            save_project_state()
+
+    if not quiet:
+        print(f"[API] Референс загружен! mediaId: {media_id}")
+    return media_id
+
+
+async def resolve_references(image_base64_list: list[str]) -> tuple[list[str], bool]:
+    """mediaId для каждого референса: из кэша проекта или свежей загрузкой. Второе значение — был ли кэш."""
+    media_ids = []
+    cached_count = 0
+    uploaded = 0
+    total = len(image_base64_list)
+
+    for i, img_b64 in enumerate(image_base64_list):
+        key = hashlib.sha256(img_b64.encode()).hexdigest()
+        cached = refs_cache.get(key)
+        if cached:
+            media_ids.append(cached)
+            cached_count += 1
+            continue
+
+        print(f"\r[API] Загрузка референсов {i+1}/{total}... ", end="", flush=True)
+        if uploaded:
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+        mid = await upload_reference_image(img_b64, active_project_id, f"ref_{int(time.time())}_{i}.jpg", quiet=True)
+        uploaded += 1
+        if mid:
+            refs_cache[key] = mid
+            save_project_state()
+            media_ids.append(mid)
+
+    if uploaded:
+        print()
+        # Пауза перед генерацией (имитация живого пользователя)
+        await asyncio.sleep(random.uniform(1.0, 2.5))
+    if cached_count:
+        print(f"[API] Референсов уже в проекте: {cached_count} из {total} — загрузку пропускаем")
+    return media_ids, cached_count > 0
 
 
 # Поддерживаемые Google Flow форматы: строка -> (отношение сторон, константа API)
@@ -333,6 +541,18 @@ SUPPORTED_RATIOS = {
     "1:1":  (1.0,    "IMAGE_ASPECT_RATIO_SQUARE"),
     "3:4":  (3 / 4,  "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"),
     "9:16": (9 / 16, "IMAGE_ASPECT_RATIO_PORTRAIT"),
+}
+
+# В новом протоколе формат передаётся не строкой, а числом (позиция сразу
+# после seed в request_item). Все пять значений подтверждены разбором живых
+# HAR-запросов с разными форматами: 1->1024x1024(1:1), 2->768x1376(9:16),
+# 3->1376x768(16:9), 4->896x1200(3:4), 5->1200x896(4:3).
+RATIO_ENUM = {
+    "IMAGE_ASPECT_RATIO_SQUARE": 1,
+    "IMAGE_ASPECT_RATIO_PORTRAIT": 2,
+    "IMAGE_ASPECT_RATIO_LANDSCAPE": 3,
+    "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR": 4,
+    "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": 5,
 }
 
 RATIO_RE = re.compile(r'\b(\d{1,2})\s*[:/]\s*(\d{1,2})\b')
@@ -396,6 +616,14 @@ def extract_aspect_ratio(req_data: dict, prompt: str):
     return SUPPORTED_RATIOS["3:4"][1], "3:4 — по умолчанию"
 
 
+def with_explanation(err, explanation: str) -> str:
+    """Исходная ошибка и, если она известна, её пояснение — одной строкой для консоли."""
+    err = str(err)
+    if explanation == err:
+        return err
+    return f"{err.rstrip('.')}. {explanation}"
+
+
 def describe_google_error(err_str: str, captcha_source: str | None = None) -> str:
     """
     Человекочитаемая ошибка для SillyTavern.
@@ -426,35 +654,49 @@ def describe_google_error(err_str: str, captcha_source: str | None = None) -> st
 
     if "recaptcha evaluation failed" in low:
         msg = ("Google не принял токен reCAPTCHA. Откройте вкладку "
-               "labs.google/fx/tools/flow и убедитесь, что вы залогинены.")
+               "flow.google.com и убедитесь, что вы залогинены.")
         if from_iframe:
-            msg += (" Токен выдал скрытый iframe — из настоящей вкладки Labs "
+            msg += (" Токен выдал скрытый iframe — из настоящей вкладки Flow "
                     "проверка проходит надёжнее.")
         return msg
 
+    if "failed to fetch" in low or "networkerror" in low:
+        return ("Браузер оборвал запрос к Google: вкладку Flow увели в фон или пропала сеть "
+                "(на телефоне — переключение между приложениями, блокировка экрана, смена "
+                "Wi-Fi или VPN). Генерация могла всё же пройти — проверьте проект на "
+                "flow.google.com. Пока идёт генерация, не сворачивайте браузер.")
+    if "content_timeout" in low or "fetch_timeout" in low:
+        return ("Google не ответил вовремя. Генерация могла всё же пройти — "
+                "проверьте проект на flow.google.com, прежде чем повторять.")
     if "captcha_timeout" in low:
-        return ("Страница Labs не успела выдать токен reCAPTCHA — вкладка спит. "
+        return ("Страница Flow не успела выдать токен reCAPTCHA — вкладка спит. "
                 "Попробуйте ещё раз.")
     if "captcha_failed" in low:
-        return ("Не удалось получить токен reCAPTCHA со страницы Labs. "
+        return ("Не удалось получить токен reCAPTCHA со страницы Flow. "
                 "Попробуйте ещё раз.")
     if "permission_denied" in low:
         return ("Google не дал доступ (PERMISSION_DENIED). Проверьте, что во "
-                "вкладке labs.google вы залогинены тем аккаунтом, у которого "
+                "вкладке flow.google.com вы залогинены тем аккаунтом, у которого "
                 "есть доступ к Flow.")
     if "resource_exhausted" in low or "public_error_high_traffic" in low or "429" in err_str:
         return "Серверы Google перегружены (слишком много запросов). Подождите немного и повторите."
     if "no_flow_tab" in low:
-        return "Нет открытой вкладки Google Labs. Откройте labs.google/fx/tools/flow в браузере."
+        return "Нет открытой вкладки Google Flow. Откройте flow.google.com в браузере."
+    if "batch_config" in low:
+        return ("Расширение ещё не поймало служебные параметры страницы Flow "
+                "(bl/f.sid/at). Откройте вкладку flow.google.com, дайте ей "
+                "полностью загрузиться, и повторите запрос.")
     if "не подключено" in err_str or "not connected" in low:
-        return "Расширение не подключено. Откройте браузер с вкладкой Google Labs."
+        return "Расширение не подключено. Откройте браузер с вкладкой Google Flow."
 
     return err_str
 
 
 @app.get("/v1/models")
 @app.get("/v1beta/models")
-async def get_models():
+async def get_models(request: Request):
+    if denied := check_proxy_key(request):
+        return denied
     models = [
         {"id": "nano-banana-pro", "name": "models/nano-banana-pro", "displayName": "Nano Banana Pro", "object": "model", "owned_by": "google"},
         {"id": "nano-banana-2", "name": "models/nano-banana-2", "displayName": "Nano Banana 2", "object": "model", "owned_by": "google"},
@@ -467,13 +709,35 @@ async def get_models():
     }
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = round(seconds)
+    if seconds < 60:
+        return f"{seconds} с"
+    return f"{seconds // 60} мин {seconds % 60:02d} с"
+
+
 @app.post("/v1beta/models/{model}:generateContent")
 async def generate_content(model: str, request: Request):
+    started = time.monotonic()
+    response = await _generate_content(model, request)
+
+    status = response.status_code if isinstance(response, JSONResponse) else 200
+    elapsed = _format_duration(time.monotonic() - started)
+    if status < 400:
+        line, color = f"УСПЕШНО · генерация заняла {elapsed}", "\033[32m"
+    else:
+        line, color = f"ОШИБКА {status} · через {elapsed}", "\033[31m"
+    print(f"{color}{line}\033[0m" if sys.stdout.isatty() else line)
+    return response
+
+
+async def _generate_content(model: str, request: Request):
+    if denied := check_proxy_key(request):
+        return denied
     prompt = ""
     image_base64_list = []
     aspect_ratio_val = "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR" # по умолчанию
     image_size_val = None
-    character_media_ids = []
 
     try:
         req_data = await request.json()
@@ -502,83 +766,32 @@ async def generate_content(model: str, request: Request):
     # Ждём расширение до 40 секунд вместо мгновенной ошибки: на Android
     # браузер мог просто уснуть и вот-вот вернётся.
     if not await bridge.wait_online(40):
-        return JSONResponse({"error": {"message": "Расширение Flow не подключено! Откройте браузер с расширением и вкладкой Labs."}}, status_code=500)
+        return JSONResponse({"error": {"message": "Расширение Flow не подключено! Откройте браузер с расширением и вкладкой Flow."}}, status_code=500)
 
     print(f"Промпт: {prompt[:150]}...")
-
-    # 1. Загружаем референсы
-    character_media_ids = []
-    total_refs = len(image_base64_list)
-    if total_refs > 0:
-        for i, img_b64 in enumerate(image_base64_list):
-            print(f"\r[API] Загрузка референсов {i+1}/{total_refs}... ", end="", flush=True)
-            if i > 0:
-                delay = random.uniform(0.5, 1.5)
-                await asyncio.sleep(delay)
-            mid = await upload_reference_image(img_b64, quiet=True)
-            if mid:
-                character_media_ids.append(mid)
-        print() # перенос строки после всех референсов
-
-    # Пауза перед генерацией (имитация живого пользователя)
-    if character_media_ids:
-        delay = random.uniform(1.0, 2.5)
-        await asyncio.sleep(delay)
 
     global active_project_id
     if not active_project_id:
         print("[API] Создание нового проекта...")
-        trpc_url = "https://labs.google/fx/api/trpc/project.createProject"
-        trpc_body = {"json": {"projectTitle": "SillyTavern Auto", "toolName": "PINHOLE"}}
-        p_res = await send_to_extension("trpc_request", {
-            "url": trpc_url,
-            "method": "POST",
-            "headers": {"content-type": "application/json", "accept": "*/*"},
-            "body": trpc_body
-        })
-
-        if p_res.get("error"):
-            print(f"[API] Ошибка создания проекта: {p_res['error']}")
-            return JSONResponse({"error": {"message": p_res['error']}}, status_code=500)
+        create_res = await batch_execute(
+            RPC_CREATE_PROJECT,
+            ["projects/*", [None, ["SillyTavern Auto"]], [None, 22]],
+            source_path="/",
+        )
+        if create_res.get("error"):
+            print(f"[API] Ошибка создания проекта: {create_res['error']}")
+            user_msg = describe_google_error(str(create_res['error']))
+            return JSONResponse({"error": {"message": user_msg}}, status_code=500)
 
         try:
-            # Ответ от trpc_request обернут в {data: {result: {data: {json: {projectId: ...}}}}}
-            p_data = p_res.get("data", {})
-            if isinstance(p_data, str):
-                p_data = json.loads(p_data)
-            # Парсим ответ
-
-            # Пробуем найти projectId в разных местах
-            if isinstance(p_data, list) and len(p_data) > 0:
-                active_project_id = p_data[0]["result"]["data"]["json"].get("result", {}).get("projectId")
-            elif "result" in p_data:
-                # В текущей версии API: p_data["result"]["data"]["json"]["result"]["projectId"]
-                json_part = p_data["result"].get("data", {}).get("json", {})
-                active_project_id = json_part.get("result", {}).get("projectId") or json_part.get("projectId")
-            elif "projectId" in p_data:
-                active_project_id = p_data["projectId"]
-            else:
-                active_project_id = p_data.get("id") # fallback
-
-            print(f"[API] Проект создан! ID: {active_project_id}")
-            save_project_id(active_project_id)
+            active_project_id = create_res["result"][0]
         except Exception as e:
-            print(f"[API] Ошибка парсинга проекта: {e}")
+            print(f"[API] Ошибка парсинга проекта: {e}, ответ: {str(create_res)[:300]}")
             return JSONResponse({"error": {"message": "Failed to create project"}}, status_code=500)
 
-    # 2. Формируем запрос на генерацию
-    ts = int(time.time() * 1000)
-    session_jitter = random.randint(100, 9999)
-    ctx = {
-        "projectId": active_project_id,
-        "recaptchaContext": {
-            "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-            "token": "",
-        },
-        "sessionId": f";{ts + session_jitter}",
-        "tool": "PINHOLE",
-        "userPaygateTier": "PAYGATE_TIER_TWO"
-    }
+        print(f"[API] Проект создан! ID: {active_project_id}")
+        # Плитка и загруженные референсы принадлежали старому проекту
+        forget_references()
 
     # Поддержка разных моделей, приходящих из SillyTavern
     # Настоящие внутренние названия из Google Labs
@@ -591,184 +804,148 @@ async def generate_content(model: str, request: Request):
     elif "pro" in m_str:
         internal_model = "GEM_PIX_2"  # Nano Banana Pro
 
-    request_item = {
-        "clientContext": ctx,
-        "seed": random.randint(100000, 999999),
-        "structuredPrompt": {"parts": [{"text": prompt}]},
-        "imageAspectRatio": aspect_ratio_val,
-        "imageModelName": internal_model,
-    }
+    # clientContext в новом протоколе — позиционный массив вместо именованных
+    # полей: [null, tool=22(PINHOLE), null, null, null, projectId, null, null,
+    #         null, null, [recaptchaToken, applicationType=1(WEB)]]
+    # Плейсхолдер токена капчи подставляет расширение — сам токен через
+    # background.js в main.py никогда не попадает.
+    client_ctx = [None, 22, None, None, None, active_project_id, None, None, None, None, [CAPTCHA_PLACEHOLDER, 1]]
+    ratio_enum = RATIO_ENUM.get(aspect_ratio_val, RATIO_ENUM["IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"])
 
-    if character_media_ids:
-        request_item["imageInputs"] = [
-            {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
-            for mid in character_media_ids
-        ]
+    for attempt in range(2):
+        # Референсы (консистентность персонажей): уже загруженные в проект
+        # берутся из кэша, новые — загружаются
+        character_media_ids, used_cache = await resolve_references(image_base64_list)
 
-    batch_id = str(uuid.uuid4())
-    body = {
-        "clientContext": ctx,
-        "mediaGenerationContext": {"batchId": batch_id},
-        "useNewMedia": True,
-        "requests": [request_item],
-    }
+        seed = random.randint(100_000_000, 999_999_999)
+        # Третья позиция request_item — референсы: [[mediaId, null, null, null, 1], ...] или null
+        image_inputs = [[mid, None, None, None, 1] for mid in character_media_ids] or None
+        request_item = [None, None, image_inputs, seed, ratio_enum, internal_model, None, client_ctx, [[[prompt]]], None, None, None,
+                         str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()]
+        gen_args = [None, [request_item], 1, client_ctx, [str(uuid.uuid4()).upper()]]
 
-    url = f"{GOOGLE_FLOW_API}/v1/projects/{active_project_id}/flowMedia:batchGenerateImages?key={GOOGLE_API_KEY}"
-    print("[API] Отправляем промпт на генерацию...")
+        print("[API] Отправляем промпт на генерацию...")
+        gen_res = await batch_execute(
+            RPC_GENERATE_IMAGE,
+            gen_args,
+            source_path=f"/project/{active_project_id}",
+            captcha_action="IMAGE_GENERATION",
+        )
 
-    gen_res = await send_to_extension("api_request", {
-        "url": url,
-        "method": "POST",
-        "headers": {"content-type": "application/json"},
-        "body": body,
-        "captchaAction": "IMAGE_GENERATION"
-    })
+        # Сохранённые референсы могли пропасть (плитку с ними удалили вручную).
+        # Google тогда отклоняет запрос, ничего не генерируя, — забываем кэш и
+        # пробуем один раз со свежей загрузкой. Антифрод и капчу так не
+        # повторяем: лишний запрос только ухудшит дело.
+        err = str(gen_res.get("error") or "")
+        stale_refs = (gen_res.get("status") == 400 or "разобрать ответ" in err) and not any(
+            s in err.lower() for s in ("unusual", "recaptcha", "captcha", "permission"))
+        if used_cache and attempt == 0 and stale_refs:
+            print("[API] Google не принял сохранённые референсы — загружаем их заново")
+            forget_references()
+            continue
+        break
 
-    # HTTP-статус проверяем тоже: на unusual activity Google иногда отдаёт
-    # не JSON с полем error, а свою страницу-заглушку. Без этой проверки такой
-    # ответ доезжал до парсера картинки и превращался в «промпт заблокирован
-    # фильтром», то есть в третью неверную формулировку той же ошибки.
-    gen_status = gen_res.get("status")
-    http_failed = isinstance(gen_status, int) and gen_status >= 400
-    if gen_res.get("error") or http_failed or (isinstance(gen_res.get("data"), dict) and gen_res["data"].get("error")):
-        err = gen_res.get("error")
-        if not err and isinstance(gen_res.get("data"), dict):
-            err = gen_res["data"].get("error")
-        if not err:
-            err = f"HTTP {gen_status}: {str(gen_res.get('data'))[:500]}"
-        print(f"[API] Ошибка генерации: {err}")
-
-        # Откуда пришёл токен reCAPTCHA — на телефоне это единственный способ
-        # понять, что его выдал скрытый iframe, а не вкладка Labs.
+    if gen_res.get("error"):
+        err = gen_res["error"]
         src = gen_res.get("captchaSource")
+        user_msg = describe_google_error(str(err), src)
+        print(f"[API] Ошибка генерации: {with_explanation(err, user_msg)}")
         if src:
             print(f"[API] Токен reCAPTCHA выдал: {src}")
-
-        user_msg = describe_google_error(str(err), src)
         return JSONResponse({"error": {"message": user_msg, "code": 500}}, status_code=500)
 
-    # Парсим картинку прямо из ответа batchGenerateImages
-    # Flow: media[0].image.generatedImage -> fifeUrl | imageUri | encodedImage
-    gen_data = gen_res.get("data", {})
-    if isinstance(gen_data, str):
-        gen_data = json.loads(gen_data)
-
-    media_list = gen_data.get("media", [])
-    if not media_list:
+    result = gen_res.get("result")
+    image_url = _find_string_containing(result, "flow-content.google/image/")
+    if not image_url:
+        print(f"[API-DEBUG] Картинка не найдена в ответе: {json.dumps(result, ensure_ascii=False)[:500]}")
         return JSONResponse({"error": {"message": "Картинка не вернулась. Возможно, промпт заблокирован фильтром."}}, status_code=500)
 
-    # Извлекаем mediaId первой генерации
-    gen_media_id = media_list[0].get("name")
+    gen_media_id = image_url.split("/image/", 1)[1].split("?", 1)[0]
 
-    # Если просят 2K — делаем второй запрос на апскейл
-    if image_size_val == "2K" and gen_media_id:
+    # Если просят 2K — делаем второй запрос на апскейл. Апскейл возвращает
+    # картинку сразу как base64 в самом ответе, без отдельного скачивания.
+    image_log = "[API] Картинка: получена"
+    if image_size_val == "2K":
         # Пауза перед апскейлом (имитация живого пользователя)
-        delay = random.uniform(1.5, 3.0)
-        await asyncio.sleep(delay)
-        print(f"[API] Запрошен 2K! Делаем апскейл картинки {gen_media_id}...")
-        upscale_body = {
-            "clientContext": ctx,
-            "mediaId": gen_media_id,
-            "targetResolution": "UPSAMPLE_IMAGE_RESOLUTION_2K"
-        }
-        upscale_url = f"{GOOGLE_FLOW_API}/v1/flow/upsampleImage?key={GOOGLE_API_KEY}"
-
-        upscale_res = await send_to_extension("api_request", {
-            "url": upscale_url,
-            "method": "POST",
-            "headers": {"content-type": "application/json"},
-            "body": upscale_body,
-            "captchaAction": "IMAGE_GENERATION"
-        })
-
-        if upscale_res.get("error") or (isinstance(upscale_res.get("data"), dict) and upscale_res["data"].get("error")) or upscale_res.get("status") == 404:
-            err_msg = upscale_res.get('status') or (upscale_res.get('data') or {}).get('error') or "неизвестно"
-            print(f"[API] Ошибка апскейла, возвращаем базовую картинку (ошибка: {err_msg}).")
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+        print(f"{image_log} · апскейл 2K...", end="", flush=True)
+        upscale_ctx = [None, 22, None, None, None, None, None, None, None, None, [CAPTCHA_PLACEHOLDER, 1]]
+        upscale_res = await batch_execute(
+            RPC_UPSCALE_IMAGE,
+            [gen_media_id, 1, upscale_ctx],
+            source_path=f"/project/{active_project_id}",
+            captcha_action="IMAGE_GENERATION",
+        )
+        upscale_b64 = None
+        if upscale_res.get("error"):
+            failure = f"апскейл не удался ({upscale_res['error']})"
         else:
-            print("[API] Апскейл запрос прошел, проверяем ответ...")
-            u_data = upscale_res.get("data", {})
+            try:
+                upscale_b64 = upscale_res["result"][1]
+                failure = "апскейл без картинки"
+            except Exception as e:
+                failure = f"ответ апскейла не разобрался ({e})"
+        if isinstance(upscale_b64, str) and upscale_b64:
+            print(f"\r{image_log} · апскейл 2K · отправлена в SillyTavern")
+            return {
+                "candidates": [{
+                    "content": {
+                        "parts": [{"inlineData": {"mimeType": "image/jpeg", "data": upscale_b64}}],
+                        "role": "model"
+                    }
+                }]
+            }
+        # Апскейл не вышел — отдаём базовую картинку
+        print(f"\r{image_log} · {failure}")
+        image_log = "[API] Картинка: базовая"
 
-            if isinstance(u_data, str) and u_data.strip():
-                try:
-                    u_data = json.loads(u_data)
-                except Exception as e:
-                    print(f"[API] Ошибка парсинга апскейла: {e}")
-                    u_data = {}
+    print(f"{image_log} · скачивается...", end="", flush=True)
+    try:
+        def _download(u):
+            req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return response.read()
 
-            if isinstance(u_data, dict) and ("media" in u_data or "image" in u_data or "encodedImage" in u_data):
-                print("[API] Успешно получили 2K картинку!")
-                gen_data = u_data
-                media_val = gen_data.get("media")
-                if isinstance(media_val, list):
-                    media_list = media_val
-                elif isinstance(media_val, dict):
-                    media_list = [media_val]
-                else:
-                    media_list = [gen_data]
-            else:
-                print("[API] Апскейл не вернул картинку, отдаем базовую (1x).")
-
-    # Извлекаем картинку
-    gen_image = media_list[0].get("image", {}).get("generatedImage", {}) if isinstance(media_list, list) and len(media_list) > 0 else {}
-    fife_url = gen_image.get("fifeUrl") or gen_image.get("imageUri")
-    encoded_b64 = gen_data.get("encodedImage") or gen_image.get("encodedImage")
-
-    if encoded_b64:
-        print(f"[API] Картинка получена как base64! Отправляем в SillyTavern.")
+        img_data = await asyncio.to_thread(_download, image_url)
+        enc = base64.b64encode(img_data).decode('utf-8')
+        print(f"\r{image_log} · скачана · отправлена в SillyTavern")
         return {
             "candidates": [{
                 "content": {
-                    "parts": [{"inlineData": {"mimeType": "image/jpeg", "data": encoded_b64}}],
+                    "parts": [{"inlineData": {"mimeType": "image/jpeg", "data": enc}}],
                     "role": "model"
                 }
             }]
         }
-    elif fife_url:
-        print(f"[API] Картинка получена как URL: {fife_url[:80]}...")
-        # Скачиваем картинку напрямую через Python (в отдельном потоке,
-        # чтобы не блокировать event loop и не ронять long-poll расширения)
-        try:
-            def _download(u):
-                req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=60) as response:
-                    return response.read()
-
-            img_data = await asyncio.to_thread(_download, fife_url)
-            enc = base64.b64encode(img_data).decode('utf-8')
-            print(f"[API] Картинка успешно скачана! Отправляем в SillyTavern.")
-            return {
-                "candidates": [{
-                    "content": {
-                        "parts": [{"inlineData": {"mimeType": "image/jpeg", "data": enc}}],
-                        "role": "model"
-                    }
-                }]
-            }
-        except Exception as e:
-            print(f"[API] Ошибка при скачивании картинки: {e}")
-            # Если не смогли скачать — вернем url напрямую
-            print(f"[API-DEBUG] Отдаем URL напрямую")
-            return {
-                "candidates": [{
-                    "content": {
-                        "parts": [{"text": fife_url}],
-                        "role": "model"
-                    }
-                }]
-            }
-    else:
-        print(f"[API-DEBUG] Нет картинки. gen_image: {json.dumps(gen_image, ensure_ascii=False)[:500]}")
-        return JSONResponse({"error": {"message": "Картинка есть, но пикселей нет"}}, status_code=500)
+    except Exception as e:
+        print(f"\r{image_log} · не скачалась ({e}) · отправлена ссылка в SillyTavern")
+        return {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": image_url}],
+                    "role": "model"
+                }
+            }]
+        }
 
 if __name__ == "__main__":
     import uvicorn
+
+    if not PROXY_KEY:
+        PROXY_KEY = ask_proxy_key()
+    if not PROXY_KEY:
+        print(f"[КЛЮЧ] ВНИМАНИЕ: ключ не задан — любой сайт в этом браузере может генерировать "
+              f"на вашем аккаунте. Создайте {KEY_FILE} или переменную FLOW_PROXY_KEY.")
+    elif len(PROXY_KEY) < MIN_KEY_LENGTH:
+        print(f"[КЛЮЧ] Ключ короче {MIN_KEY_LENGTH} символов — его легко подобрать, лучше сменить.")
+
     print("[СЕРВЕР] Слушаем http://127.0.0.1:8001 — ждём расширение...")
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        # Только это устройство: и расширение, и SillyTavern (даже на чужом
+        # сервере — запросы sillyimages идут из браузера) ходят сюда локально
+        host="127.0.0.1",
         port=8001,
         # keep-alive должен переживать 25-секундный long-poll расширения
         timeout_keep_alive=75,
-        ws_ping_interval=25,
-        ws_ping_timeout=60,
     )
