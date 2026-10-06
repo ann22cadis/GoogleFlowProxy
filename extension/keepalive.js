@@ -55,9 +55,9 @@ function flowBuildToneWav({ freq = 30, seconds = 15, amplitude = 160, rate = 800
   return 'data:audio/wav;base64,' + btoa(bin);
 }
 
-let _flowAudio = null;
-let _flowAudioArmed = false;
-let _flowUserPaused = false;   // пользователь сам нажал паузу — уважаем это
+var _flowAudio = _flowAudio ?? null;
+var _flowAudioArmed = _flowAudioArmed ?? false;
+var _flowUserPaused = _flowUserPaused ?? false;   // пользователь сам нажал паузу — уважаем это
 
 async function flowSetKeepaliveEnabled(enabled) {
   _flowUserPaused = !enabled;

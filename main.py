@@ -157,6 +157,41 @@ RPC_UPSCALE_IMAGE = "SPrCad"
 
 CAPTCHA_PLACEHOLDER = "__CAPTCHA__"
 
+# Коды ошибок gRPC, которые Google кладёт в wrb.fr вместо результата
+GRPC_CODES = {
+    1: "CANCELLED", 2: "UNKNOWN", 3: "INVALID_ARGUMENT", 4: "DEADLINE_EXCEEDED",
+    5: "NOT_FOUND", 6: "ALREADY_EXISTS", 7: "PERMISSION_DENIED", 8: "RESOURCE_EXHAUSTED",
+    9: "FAILED_PRECONDITION", 10: "ABORTED", 11: "OUT_OF_RANGE", 12: "UNIMPLEMENTED",
+    13: "INTERNAL", 14: "UNAVAILABLE", 15: "DATA_LOSS", 16: "UNAUTHENTICATED",
+}
+
+
+class RpcError(Exception):
+    """Google ответил на RPC ошибкой: в wrb.fr вместо результата null, а код — в поле 5."""
+
+    def __init__(self, code, details: list[str], raw=None):
+        self.code = code
+        if code is None:
+            text = "Google вернул ошибку без кода"
+        else:
+            text = f"Google вернул ошибку {GRPC_CODES.get(code, 'UNKNOWN')} ({code})"
+        if details:
+            text += ": " + ", ".join(details)
+        elif raw is not None:
+            # Деталей нет — показываем сырой статус, чтобы было за что зацепиться
+            text += " [" + json.dumps(raw, ensure_ascii=False)[:200] + "]"
+        super().__init__(text)
+
+
+def _collect_strings(obj, out: list[str]):
+    if isinstance(obj, str):
+        if obj and not obj.startswith("type.googleapis.com/") and obj not in out:
+            out.append(obj)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_strings(item, out)
+    return out
+
 
 def parse_batchexecute_response(text: str, rpcid: str):
     """
@@ -182,6 +217,11 @@ def parse_batchexecute_response(text: str, rpcid: str):
                 continue
             for entry in chunk:
                 if isinstance(entry, list) and len(entry) >= 3 and entry[0] == "wrb.fr" and entry[1] == rpcid:
+                    if entry[2] is None:
+                        # Ошибка метода: ["wrb.fr", rpcid, null, null, null, [код, null, [детали]], ...]
+                        status = entry[5] if len(entry) > 5 and isinstance(entry[5], list) else []
+                        code = status[0] if status and isinstance(status[0], int) else None
+                        raise RpcError(code, _collect_strings(status[1:], [])[:5], status)
                     return json.loads(entry[2])
         i += 1
     raise ValueError(f"Не нашли wrb.fr для {rpcid} в ответе batchexecute")
@@ -212,17 +252,24 @@ async def batch_execute(rpcid: str, args, source_path: str, captcha_action: str 
     if res.get("error"):
         return res
 
+    captcha_source = res.get("captchaSource")
     status = res.get("status")
     if isinstance(status, int) and status >= 400:
-        return {"error": f"HTTP {status}: {str(res.get('data'))[:500]}", "status": status}
+        return {"error": f"HTTP {status}: {str(res.get('data'))[:500]}", "status": status,
+                "captchaSource": captcha_source}
 
     raw_text = res.get("data") or ""
     try:
         parsed = parse_batchexecute_response(raw_text, rpcid)
+    except RpcError as e:
+        return {"error": str(e), "rpc_code": e.code, "captchaSource": captcha_source}
     except Exception as e:
-        return {"error": f"Не смогли разобрать ответ Google: {e}"}
+        return {"error": f"Не смогли разобрать ответ Google: {e}", "captchaSource": captcha_source}
 
-    return {"result": parsed}
+    return {"result": parsed, "captchaSource": captcha_source}
+
+# Какое внутреннее имя модели сработало в этой сессии (см. _generate_content)
+working_models: dict[str, str] = {}
 
 # Храним project_id на диске, чтобы не создавать новые проекты при каждом рестарте
 PROJECT_FILE = "active_project.json"
@@ -470,7 +517,8 @@ async def upload_reference_image(image_base64: str, project_id: str, filename: s
         )
 
         status = res.get("status")
-        rejected = (isinstance(status, int) and 400 <= status < 500) or "разобрать ответ" in str(res.get("error"))
+        rejected = (isinstance(status, int) and 400 <= status < 500) or res.get("rpc_code") in (3, 5) \
+            or "разобрать ответ" in str(res.get("error"))
         if container and attempt == 0 and rejected:
             # Скорее всего, плитку-контейнер удалили из проекта вручную
             print("\n[API] Плитка для референсов недоступна — заводим новую")
@@ -650,7 +698,9 @@ def describe_google_error(err_str: str, captcha_source: str | None = None) -> st
     from_iframe = bool(captcha_source) and "iframe" in captcha_source
 
     if "unusual_activity" in low or "unusual activity" in low:
-        return "Google отклонил запрос: подозрительная активность (UNUSUAL_ACTIVITY)."
+        return ("Google отклонил запрос: подозрительная активность (UNUSUAL_ACTIVITY). "
+                "Это антифрод, а не поломка прокси: смените сервер VPN или выключите его, "
+                "подождите 10–15 минут и генерируйте реже.")
 
     if "recaptcha evaluation failed" in low:
         msg = ("Google не принял токен reCAPTCHA. Откройте вкладку "
@@ -668,6 +718,9 @@ def describe_google_error(err_str: str, captcha_source: str | None = None) -> st
     if "content_timeout" in low or "fetch_timeout" in low:
         return ("Google не ответил вовремя. Генерация могла всё же пройти — "
                 "проверьте проект на flow.google.com, прежде чем повторять.")
+    if "recaptcha_needs_reload" in low:
+        return ("Вкладка Flow открыта со старой версией расширения. Обновите её (F5) "
+                "и повторите запрос.")
     if "captcha_timeout" in low:
         return ("Страница Flow не успела выдать токен reCAPTCHA — вкладка спит. "
                 "Попробуйте ещё раз.")
@@ -688,6 +741,17 @@ def describe_google_error(err_str: str, captcha_source: str | None = None) -> st
                 "полностью загрузиться, и повторите запрос.")
     if "не подключено" in err_str or "not connected" in low:
         return "Расширение не подключено. Откройте браузер с вкладкой Google Flow."
+    if "unauthenticated" in low:
+        return ("Google не видит вход в аккаунт (UNAUTHENTICATED). Откройте "
+                "flow.google.com, залогиньтесь и обновите вкладку.")
+    if "invalid_argument" in low:
+        return ("Google не принял запрос (INVALID_ARGUMENT). Если повторяется на "
+                "любом промпте — Google поменял формат запроса, прокси нужно обновить.")
+    if "not_found" in low:
+        return ("Google не нашёл проект, референс или модель (NOT_FOUND). Если вы "
+                "удаляли проект на flow.google.com — удалите файл active_project.json "
+                "и перезапустите прокси. Если не удаляли — Google мог снять модель, "
+                "попробуйте другую или обновите прокси.")
 
     return err_str
 
@@ -699,7 +763,7 @@ async def get_models(request: Request):
         return denied
     models = [
         {"id": "nano-banana-pro", "name": "models/nano-banana-pro", "displayName": "Nano Banana Pro", "object": "model", "owned_by": "google"},
-        {"id": "nano-banana-2", "name": "models/nano-banana-2", "displayName": "Nano Banana 2", "object": "model", "owned_by": "google"},
+        {"id": "nano-banana-2.1", "name": "models/nano-banana-2.1", "displayName": "Nano Banana 2.1", "object": "model", "owned_by": "google"},
         {"id": "nano-banana-2-lite", "name": "models/nano-banana-2-lite", "displayName": "Nano Banana 2 Lite", "object": "model", "owned_by": "google"},
     ]
     return {
@@ -793,16 +857,21 @@ async def _generate_content(model: str, request: Request):
         # Плитка и загруженные референсы принадлежали старому проекту
         forget_references()
 
-    # Поддержка разных моделей, приходящих из SillyTavern
-    # Настоящие внутренние названия из Google Labs
-    internal_model = "GEM_PIX_2"  # Nano Banana Pro
+    # Поддержка разных моделей, приходящих из SillyTavern.
+    # Внутренние названия из Google Flow. Google иногда заменяет модель новой
+    # версией и старое имя начинает отвечать NOT_FOUND (так NARWHAL заменили на
+    # Nano Banana 2.1), поэтому у модели бывает несколько кандидатов: пробуем
+    # по порядку и запоминаем тот, что сработал.
     m_str = model.lower()
     if "lite" in m_str:
-        internal_model = "HARBOR_SEAL"  # Nano Banana 2 Lite
+        model_key, model_candidates = "lite", ["HARBOR_SEAL"]  # Nano Banana 2 Lite
     elif "2" in m_str:
-        internal_model = "NARWHAL"  # Nano Banana 2
-    elif "pro" in m_str:
-        internal_model = "GEM_PIX_2"  # Nano Banana Pro
+        model_key, model_candidates = "2", ["BELUGA", "NARWHAL"]  # Nano Banana 2.1 / 2
+    else:
+        model_key, model_candidates = "pro", ["GEM_PIX_2"]  # Nano Banana Pro
+    if working_models.get(model_key) in model_candidates:
+        preferred = working_models[model_key]
+        model_candidates = [preferred] + [m for m in model_candidates if m != preferred]
 
     # clientContext в новом протоколе — позиционный массив вместо именованных
     # полей: [null, tool=22(PINHOLE), null, null, null, projectId, null, null,
@@ -812,38 +881,50 @@ async def _generate_content(model: str, request: Request):
     client_ctx = [None, 22, None, None, None, active_project_id, None, None, None, None, [CAPTCHA_PLACEHOLDER, 1]]
     ratio_enum = RATIO_ENUM.get(aspect_ratio_val, RATIO_ENUM["IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"])
 
-    for attempt in range(2):
-        # Референсы (консистентность персонажей): уже загруженные в проект
-        # берутся из кэша, новые — загружаются
-        character_media_ids, used_cache = await resolve_references(image_base64_list)
+    for model_idx, internal_model in enumerate(model_candidates):
+        for attempt in range(2):
+            # Референсы (консистентность персонажей): уже загруженные в проект
+            # берутся из кэша, новые — загружаются
+            character_media_ids, used_cache = await resolve_references(image_base64_list)
 
-        seed = random.randint(100_000_000, 999_999_999)
-        # Третья позиция request_item — референсы: [[mediaId, null, null, null, 1], ...] или null
-        image_inputs = [[mid, None, None, None, 1] for mid in character_media_ids] or None
-        request_item = [None, None, image_inputs, seed, ratio_enum, internal_model, None, client_ctx, [[[prompt]]], None, None, None,
-                         str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()]
-        gen_args = [None, [request_item], 1, client_ctx, [str(uuid.uuid4()).upper()]]
+            seed = random.randint(100_000_000, 999_999_999)
+            # Третья позиция request_item — референсы: [[mediaId, null, null, null, 1], ...] или null
+            image_inputs = [[mid, None, None, None, 1] for mid in character_media_ids] or None
+            request_item = [None, None, image_inputs, seed, ratio_enum, internal_model, None, client_ctx, [[[prompt]]], None, None, None,
+                             str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()]
+            gen_args = [None, [request_item], 1, client_ctx, [str(uuid.uuid4()).upper()]]
 
-        print("[API] Отправляем промпт на генерацию...")
-        gen_res = await batch_execute(
-            RPC_GENERATE_IMAGE,
-            gen_args,
-            source_path=f"/project/{active_project_id}",
-            captcha_action="IMAGE_GENERATION",
-        )
+            print("[API] Отправляем промпт на генерацию...")
+            gen_res = await batch_execute(
+                RPC_GENERATE_IMAGE,
+                gen_args,
+                source_path=f"/project/{active_project_id}",
+                captcha_action="IMAGE_GENERATION",
+            )
 
-        # Сохранённые референсы могли пропасть (плитку с ними удалили вручную).
-        # Google тогда отклоняет запрос, ничего не генерируя, — забываем кэш и
-        # пробуем один раз со свежей загрузкой. Антифрод и капчу так не
-        # повторяем: лишний запрос только ухудшит дело.
-        err = str(gen_res.get("error") or "")
-        stale_refs = (gen_res.get("status") == 400 or "разобрать ответ" in err) and not any(
-            s in err.lower() for s in ("unusual", "recaptcha", "captcha", "permission"))
-        if used_cache and attempt == 0 and stale_refs:
-            print("[API] Google не принял сохранённые референсы — загружаем их заново")
-            forget_references()
+            # Сохранённые референсы могли пропасть (плитку с ними удалили вручную).
+            # Google тогда отклоняет запрос, ничего не генерируя, — забываем кэш и
+            # пробуем один раз со свежей загрузкой. Антифрод и капчу так не
+            # повторяем: лишний запрос только ухудшит дело.
+            err = str(gen_res.get("error") or "")
+            if gen_res.get("rpc_code") == 5 and model_idx < len(model_candidates) - 1:
+                break  # скорее всего, модель снята — сначала пробуем следующую, а не перезагружаем референсы
+            stale_refs = (gen_res.get("status") == 400 or gen_res.get("rpc_code") in (3, 5)
+                          or "разобрать ответ" in err) and not any(
+                s in err.lower() for s in ("unusual", "recaptcha", "captcha", "permission"))
+            if used_cache and attempt == 0 and stale_refs:
+                print("[API] Google не принял сохранённые референсы — загружаем их заново")
+                forget_references()
+                continue
+            break
+
+        if gen_res.get("rpc_code") == 5 and model_idx < len(model_candidates) - 1:
+            print("[API] Новая версия модели не найдена — пробуем предыдущую")
             continue
         break
+
+    if not gen_res.get("error"):
+        working_models[model_key] = internal_model
 
     if gen_res.get("error"):
         err = gen_res["error"]

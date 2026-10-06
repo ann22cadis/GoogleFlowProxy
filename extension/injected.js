@@ -89,16 +89,36 @@
     } catch (e) {
       // Сайт мог загрузить reCAPTCHA без render=SITE_KEY — тогда execute с
       // ключом падает. Догружаем свою копию с нужным ключом и пробуем ещё раз.
-      if (_recaptchaLoading) throw e;
+      if (_recaptchaLoading || e.message === 'RECAPTCHA_NEEDS_RELOAD') throw e;
       await loadRecaptchaScript();
       return await executeWhenReady(pageAction);
     }
   }
 
+  // Оригинальный execute, который recaptcha_guard.js забрал у сайта раньше,
+  // чем тот его подменил (см. комментарий в recaptcha_guard.js)
+  const EXECUTE_SLOT = Symbol.for('flowProxy.recaptchaExecute');
+
+  function pickExecute() {
+    const enterprise = window.grecaptcha.enterprise;
+    if (typeof window[EXECUTE_SLOT] === 'function') return window[EXECUTE_SLOT];
+    // Сайт подменил execute, а оригинал мы не успели забрать — вкладка
+    // открыта до установки/обновления расширения. Токен из подмены сайт засчитает
+    // как «вызвано расширением», поэтому честно просим перезагрузить вкладку.
+    if (String(enterprise.execute).includes('extension_hijack_detected')) {
+      throw new Error('RECAPTCHA_NEEDS_RELOAD');
+    }
+    return enterprise.execute.bind(enterprise);
+  }
+
   function executeWhenReady(pageAction) {
     return new Promise((resolve, reject) => {
       window.grecaptcha.enterprise.ready(() => {
-        window.grecaptcha.enterprise.execute(SITE_KEY, { action: pageAction }).then(resolve, reject);
+        try {
+          pickExecute()(SITE_KEY, { action: pageAction }).then(resolve, reject);
+        } catch (e) {
+          reject(e);
+        }
       });
     });
   }

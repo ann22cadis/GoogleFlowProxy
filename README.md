@@ -145,7 +145,7 @@ Android убивает Service Worker расширения каждый раз, 
    - **URL эндпоинта:** `http://127.0.0.1:8001`
    - **Модель:**
      - `Nano Banana 2 Lite`
-     - `Nano Banana 2`
+     - `Nano Banana 2.1`
      - `Nano Banana Pro`
    - **Размер изображения:** `2K` (по желанию, включит авто-апскейл)
    - **API ключ:** ваш ключ доступа из файла `proxy_key.txt`

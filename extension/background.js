@@ -499,7 +499,7 @@ async function requestCaptchaFromFrame(target, requestId, pageAction) {
 
     await chrome.scripting.executeScript({
       target: frameId != null ? { tabId, frameIds: [frameId] } : { tabId },
-      files: ['content.js'],
+      files: ['keepalive.js', 'content.js'],
     });
     await sleep(500);
     return await chrome.tabs.sendMessage(tabId, message, options);
@@ -632,7 +632,7 @@ async function requestFlowFetchFromFrame(target, requestId, url, body, headers) 
 
     await chrome.scripting.executeScript({
       target: frameId != null ? { tabId, frameIds: [frameId] } : { tabId },
-      files: ['content.js'],
+      files: ['keepalive.js', 'content.js'],
     });
     await sleep(500);
     return await chrome.tabs.sendMessage(tabId, message, options);
