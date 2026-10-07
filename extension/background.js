@@ -497,10 +497,9 @@ async function requestCaptchaFromFrame(target, requestId, pageAction) {
       msg.includes('Could not establish connection');
     if (!shouldInject) throw error;
 
-    await chrome.scripting.executeScript({
-      target: frameId != null ? { tabId, frameIds: [frameId] } : { tabId },
-      files: ['keepalive.js', 'content.js'],
-    });
+    const injectTarget = frameId != null ? { tabId, frameIds: [frameId] } : { tabId };
+    await chrome.scripting.executeScript({ target: injectTarget, files: ['injected.js'], world: 'MAIN' });
+    await chrome.scripting.executeScript({ target: injectTarget, files: ['keepalive.js', 'content.js'] });
     await sleep(500);
     return await chrome.tabs.sendMessage(tabId, message, options);
   }
@@ -630,10 +629,9 @@ async function requestFlowFetchFromFrame(target, requestId, url, body, headers) 
       msg.includes('Could not establish connection');
     if (!shouldInject) throw error;
 
-    await chrome.scripting.executeScript({
-      target: frameId != null ? { tabId, frameIds: [frameId] } : { tabId },
-      files: ['keepalive.js', 'content.js'],
-    });
+    const injectTarget = frameId != null ? { tabId, frameIds: [frameId] } : { tabId };
+    await chrome.scripting.executeScript({ target: injectTarget, files: ['injected.js'], world: 'MAIN' });
+    await chrome.scripting.executeScript({ target: injectTarget, files: ['keepalive.js', 'content.js'] });
     await sleep(500);
     return await chrome.tabs.sendMessage(tabId, message, options);
   }

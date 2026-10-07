@@ -22,6 +22,8 @@
       const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
       if (enterprise && thisArg === enterprise && this === enterprise.execute) {
         window[SLOT] = bound;
+        // Больше не нужен: страница работает с родным bind
+        Function.prototype.bind = nativeBind;
       }
     } catch { /* страница не должна заметить наше присутствие */ }
     return bound;

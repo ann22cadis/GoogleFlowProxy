@@ -8,8 +8,9 @@
  * вкладке SillyTavern), поэтому защищаемся от повторной установки хуков.
  */
 (function () {
-  if (window.__flowInjected) return;
-  window.__flowInjected = true;
+  const LOADED = Symbol.for('flowProxy.injected');
+  if (window[LOADED]) return;
+  Object.defineProperty(window, LOADED, { value: true, configurable: true, enumerable: false });
 
   const SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 
@@ -17,14 +18,18 @@
   // Свёрнутая вкладка получает hidden=true и замороженный rAF, после чего
   // reCAPTCHA Enterprise отказывается выдавать токен. Убеждаем страницу,
   // что на неё всё время смотрят.
-  try {
+  // Только там, где это нужно: на Android и в скрытом iframe во вкладке
+  // SillyTavern. Обычная вкладка Flow на компьютере не засыпает, а сайт
+  // замечает изменённую страницу и отказывает в генерации даже вручную.
+  const needsKeepAwake = /Android/i.test(navigator.userAgent) || window.top !== window;
+  if (needsKeepAwake) try {
     Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
     Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
   } catch (e) {
     console.warn('[Flow] Не смогли подменить visibilityState:', e);
   }
 
-  try {
+  if (needsKeepAwake) try {
     let lastTime = 0;
     window.requestAnimationFrame = function (callback) {
       const currTime = Date.now();
@@ -137,6 +142,9 @@
       } catch {
         s.src = url;
       }
+      // nonce берём у скриптов самой страницы — так же подгружает reCAPTCHA сайт
+      const nonce = document.querySelector('script[nonce]')?.nonce;
+      if (nonce) s.nonce = nonce;
       s.async = true;
       s.onload = () => resolve(true);
       s.onerror = () => resolve(false);

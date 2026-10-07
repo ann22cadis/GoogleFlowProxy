@@ -1,5 +1,6 @@
 /**
- * Content script на flow.google.com — мост между background.js и injected.js.
+ * Content script на flow.google.com — мост между background.js и injected.js
+ * (injected.js подключается манифестом прямо в MAIN world, без тега <script>).
  * Работает во ВСЕХ фреймах, включая скрытый iframe, который st_injector.js
  * вставляет во вкладку SillyTavern: капчу умеет выдавать любой фрейм
  * с origin flow.google.com, и такой iframe переживает Android гораздо лучше,
@@ -9,13 +10,6 @@
 // Скрипт может быть внедрён повторно через chrome.scripting — не дублируем слушателей
 if (!window.__flowContentLoaded) {
   window.__flowContentLoaded = true;
-
-  (function injectMainWorld() {
-    const s = document.createElement('script');
-    s.src = chrome.runtime.getURL('injected.js');
-    s.onload = () => s.remove();
-    (document.head || document.documentElement).appendChild(s);
-  })();
 
   chrome.runtime.onMessage.addListener((msg, _, reply) => {
     if (msg.type !== 'GET_CAPTCHA') return;
@@ -116,5 +110,6 @@ if (!window.__flowContentLoaded) {
   // ─── Звуковой keepalive (см. keepalive.js) ────────────────
   // Только в верхнем фрейме: если мы внутри iframe на странице SillyTavern,
   // звук уже играет сама эта страница (st_injector.js), второй поток не нужен.
-  if (window.top === window) flowStartAudioKeepalive();
+  // На компьютере вкладка не засыпает, и звук там не нужен.
+  if (window.top === window && /Android/i.test(navigator.userAgent)) flowStartAudioKeepalive();
 }
