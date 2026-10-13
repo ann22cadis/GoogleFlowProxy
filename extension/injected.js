@@ -133,7 +133,9 @@
   function loadRecaptchaScript() {
     if (_recaptchaLoading) return _recaptchaLoading;
     _recaptchaLoading = new Promise((resolve) => {
-      const url = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
+      // trustedtypes=true — как у самого сайта: без него reCAPTCHA пишет в DOM
+      // обычные строки, Trusted Types страницы их блокирует, и токен виснет до таймаута
+      const url = `https://www.google.com/recaptcha/enterprise.js?trustedtypes=true&render=${SITE_KEY}`;
       const s = document.createElement('script');
       try {
         // У сайта включён Trusted Types: строку в script.src без политики не пустят
