@@ -52,17 +52,39 @@ if "allow_private_network" in inspect.signature(CORSMiddleware.__init__).paramet
 app.add_middleware(CORSMiddleware, **_cors_options)
 
 EXTENSION_ORIGINS = ("chrome-extension://", "moz-extension://")
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+# Свой заголовок расширения. Сайт не может отправить его «вслепую» (no-cors), а
+# в режиме cors браузер сначала шлёт preflight с Origin, и его отклоняет проверка ниже.
+EXTENSION_HEADER = "x-flow-extension"
+
+
+def _host_name(host: str) -> str:
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    return host.split(":", 1)[0]
 
 
 @app.middleware("http")
 async def local_guard(request: Request, call_next):
+    # DNS rebinding: чужой домен, который вдруг указывает на 127.0.0.1, для
+    # браузера «свой» — его страница читает ответы прокси без всякого CORS.
+    # Отличить его можно только по Host: к настоящему прокси ходят по 127.0.0.1.
+    if _host_name(request.headers.get("host", "")) not in LOCAL_HOSTS:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
     # sillyimages ходит к прокси прямо из браузера, поэтому CORS открыт. Но
     # тогда и любой открытый сайт мог бы читать /api/ext/poll — промпты и
-    # референсы из очереди. Расширение приходит со своим origin или без него,
-    # а обычная страница всегда присылает свой.
-    if request.url.path.startswith("/api/ext/"):
+    # референсы из очереди — или забирать задачи вслепую через no-cors, а по
+    # /health узнавать, что прокси у вас запущен. Эти адреса — только для
+    # расширения: страница всегда присылает свой Origin (в preflight тоже),
+    # а свой заголовок без preflight отправить не может.
+    path = request.url.path
+    if path.startswith("/api/ext/") or path == "/health":
         origin = request.headers.get("origin")
         if origin and not origin.startswith(EXTENSION_ORIGINS):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        if request.method != "OPTIONS" and request.headers.get(EXTENSION_HEADER) != "1":
             return JSONResponse({"error": "forbidden"}, status_code=403)
 
     response = await call_next(request)
@@ -99,7 +121,12 @@ def ask_proxy_key() -> str | None:
         return None
     print("\n[КЛЮЧ] Придумайте ключ доступа к прокси — он работает как пароль.")
     print("[КЛЮЧ] Его нужно будет вписать в SillyTavern в поле «API ключ».")
-    entered = input("[КЛЮЧ] Ваш ключ (Enter — сгенерировать случайный): ").strip()
+    try:
+        entered = input("[КЛЮЧ] Ваш ключ (Enter — сгенерировать случайный): ").strip()
+    except (EOFError, OSError):
+        # На Windows stdin из NUL притворяется терминалом, но читать из него нечего
+        print()
+        return None
     key = entered or secrets.token_urlsafe(24)
     with open(KEY_FILE, "w", encoding="utf-8") as f:
         f.write(key)
@@ -1015,8 +1042,14 @@ if __name__ == "__main__":
     if not PROXY_KEY:
         PROXY_KEY = ask_proxy_key()
     if not PROXY_KEY:
-        print(f"[КЛЮЧ] ВНИМАНИЕ: ключ не задан — любой сайт в этом браузере может генерировать "
-              f"на вашем аккаунте. Создайте {KEY_FILE} или переменную FLOW_PROXY_KEY.")
+        # Без терминала (pm2, автозапуск) спросить некого. Работать без пароля
+        # нельзя — любой сайт в браузере генерировал бы на вашем аккаунте, —
+        # поэтому создаём случайный ключ сами. В консоль (и логи pm2) его не пишем.
+        PROXY_KEY = secrets.token_urlsafe(24)
+        with open(KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(PROXY_KEY)
+        print(f"[КЛЮЧ] Ключ доступа сгенерирован и сохранён в {os.path.abspath(KEY_FILE)} — "
+              f"впишите его в SillyTavern в поле «API ключ».")
     elif len(PROXY_KEY) < MIN_KEY_LENGTH:
         print(f"[КЛЮЧ] Ключ короче {MIN_KEY_LENGTH} символов — его легко подобрать, лучше сменить.")
 

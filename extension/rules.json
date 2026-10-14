@@ -11,7 +11,8 @@
     },
     "condition": {
       "urlFilter": "||flow.google.com^",
-      "resourceTypes": ["sub_frame"]
+      "resourceTypes": ["sub_frame"],
+      "initiatorDomains": ["localhost", "127.0.0.1", "flow.google.com"]
     }
   }
 ]

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Local agent bridge for Google Flow API — captures tokens, solves reCAPTCHA, proxies API calls",
   "permissions": [
     "storage",
@@ -57,18 +57,6 @@
         "st_injector.js"
       ],
       "run_at": "document_idle"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "offscreen.html",
-        "offscreen.js"
-      ],
-      "matches": [
-        "https://flow.google.com/*",
-        "<all_urls>"
-      ]
     }
   ],
   "declarative_net_request": {

@@ -59,10 +59,13 @@ var _flowAudio = _flowAudio ?? null;
 var _flowAudioArmed = _flowAudioArmed ?? false;
 var _flowUserPaused = _flowUserPaused ?? false;   // пользователь сам нажал паузу — уважаем это
 
-async function flowSetKeepaliveEnabled(enabled) {
-  _flowUserPaused = !enabled;
-  try { await chrome.storage.local.set({ audioKeepalive: enabled }); } catch {}
-  try { navigator.mediaSession.playbackState = enabled ? 'playing' : 'paused'; } catch {}
+// Пауза из шторки действует только до перезагрузки страницы. Раньше она
+// сохранялась насовсем: после перезагрузки звук не стартовал, плеера в шторке
+// не было — и включить защиту обратно на телефоне было нечем. Насовсем
+// выключает только кнопка Audio в попапе (ключ audioKeepaliveOff).
+function flowSetKeepalivePaused(paused) {
+  _flowUserPaused = paused;
+  try { navigator.mediaSession.playbackState = paused ? 'paused' : 'playing'; } catch {}
 }
 
 async function flowStartAudioKeepalive() {
@@ -70,8 +73,9 @@ async function flowStartAudioKeepalive() {
   _flowAudioArmed = true;
 
   try {
-    const { audioKeepalive } = await chrome.storage.local.get('audioKeepalive');
-    if (audioKeepalive === false) {
+    // Старый ключ audioKeepalive не читаем: его записывала и пауза из шторки
+    const { audioKeepaliveOff } = await chrome.storage.local.get('audioKeepaliveOff');
+    if (audioKeepaliveOff === true) {
       console.log('[Flow] Звуковой keepalive выключен пользователем');
       return;
     }
@@ -101,13 +105,13 @@ async function flowStartAudioKeepalive() {
           // Кнопка паузы в шторке уведомлений — это и есть тумблер на телефоне,
           // где попап расширения открыть практически невозможно.
           navigator.mediaSession.setActionHandler('pause', () => {
-            console.log('[Flow] Keepalive выключен из шторки');
-            flowSetKeepaliveEnabled(false);
+            console.log('[Flow] Keepalive на паузе из шторки (до перезагрузки страницы)');
+            flowSetKeepalivePaused(true);
             _flowAudio.pause();
           });
           navigator.mediaSession.setActionHandler('play', () => {
             console.log('[Flow] Keepalive включён из шторки');
-            flowSetKeepaliveEnabled(true);
+            flowSetKeepalivePaused(false);
             _flowAudio.play().catch(() => {});
           });
         } catch {}

@@ -132,9 +132,39 @@ document.getElementById('btn-panel').addEventListener('click', () => {
   });
 });
 
+// Защиту flow.google.com от встраивания статическое правило снимает только
+// для таверны на localhost. Для таверны на чужом хостинге — временное правило
+// сессии: только эта вкладка и только её сайт. Удаляется при закрытии вкладки.
+async function allowFlowIframeInTab(tab) {
+  let host;
+  try { host = new URL(tab.url).hostname; } catch { return; }
+  if (!host) return;
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [tab.id],
+    addRules: [{
+      id: tab.id,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [
+          { header: 'X-Frame-Options', operation: 'remove' },
+          { header: 'Content-Security-Policy', operation: 'remove' },
+        ],
+      },
+      condition: {
+        urlFilter: '||flow.google.com^',
+        resourceTypes: ['sub_frame'],
+        tabIds: [tab.id],
+        initiatorDomains: [host, 'flow.google.com'],
+      },
+    }],
+  });
+}
+
 document.getElementById('btn-embed').addEventListener('click', () => {
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
     if (tabs[0]) {
+      try { await allowFlowIframeInTab(tabs[0]); } catch (e) { console.error('Не смогли разрешить iframe Flow:', e); }
       chrome.scripting.executeScript({
         target: { tabId: tabs[0].id },
         files: ['keepalive.js', 'st_injector.js']
@@ -159,14 +189,16 @@ function renderAudioBtn(enabled) {
     : 'Защита от засыпания выключена — на телефоне прокси будет отваливаться. Нажмите, чтобы включить.';
 }
 
-chrome.storage.local.get('audioKeepalive', ({ audioKeepalive }) => {
-  renderAudioBtn(audioKeepalive !== false);
+// Отдельный ключ, а не прежний audioKeepalive: тот записывала и пауза из
+// шторки, и у многих он застрял в false (см. keepalive.js)
+chrome.storage.local.get('audioKeepaliveOff', ({ audioKeepaliveOff }) => {
+  renderAudioBtn(audioKeepaliveOff !== true);
 });
 
 audioBtn.addEventListener('click', () => {
-  chrome.storage.local.get('audioKeepalive', ({ audioKeepalive }) => {
-    const next = audioKeepalive === false; // было выключено -> включаем
-    chrome.storage.local.set({ audioKeepalive: next }, () => {
+  chrome.storage.local.get('audioKeepaliveOff', ({ audioKeepaliveOff }) => {
+    const next = audioKeepaliveOff === true; // было выключено -> включаем
+    chrome.storage.local.set({ audioKeepaliveOff: !next }, () => {
       renderAudioBtn(next);
       // Настройка читается при старте content script — нужна перезагрузка вкладки
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {

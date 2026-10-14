@@ -17,7 +17,7 @@ setInterval(() => {
 // Также делаем fetch на /health чтобы держать сетевую активность
 setInterval(async () => {
   try {
-    await fetch('http://127.0.0.1:8001/health', { method: 'GET', cache: 'no-store' });
+    await fetch('http://127.0.0.1:8001/health', { method: 'GET', cache: 'no-store', headers: { 'X-Flow-Extension': '1' } });
   } catch {
     // Сервер не запущен — не страшно, SW всё равно разбудился
   }

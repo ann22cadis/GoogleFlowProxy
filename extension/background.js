@@ -16,6 +16,8 @@
 const AGENT_BASE = 'http://127.0.0.1:8001';
 const POLL_URL = `${AGENT_BASE}/api/ext/poll?wait=25`;
 const CALLBACK_URL = `${AGENT_BASE}/api/ext/callback`;
+// Прокси пускает к /api/ext только с этим заголовком (защита от сайтов, см. main.py)
+const PROXY_HEADERS = { 'X-Flow-Extension': '1' };
 
 const FLOW_URL = 'https://flow.google.com/';
 const FLOW_TAB_PATTERNS = ['https://flow.google.com/*'];
@@ -151,7 +153,7 @@ async function startPolling() {
     while (!manualDisconnect) {
       let jobs = [];
       try {
-        const resp = await fetch(POLL_URL, { cache: 'no-store' });
+        const resp = await fetch(POLL_URL, { cache: 'no-store', headers: PROXY_HEADERS });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         jobs = (await resp.json()).jobs || [];
         if (state === 'off') setState('idle');
@@ -182,7 +184,7 @@ function ackJob(id) {
   // и не выдаст её второй раз (иначе можно дважды сжечь генерацию).
   fetch(CALLBACK_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...PROXY_HEADERS },
     body: JSON.stringify({ id, ack: true }),
   }).catch(() => {});
 }
@@ -221,7 +223,7 @@ async function sendToAgent(msg) {
     try {
       const resp = await fetch(CALLBACK_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...PROXY_HEADERS },
         body: JSON.stringify(msg),
       });
       if (resp.ok) return true;
@@ -274,6 +276,8 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  // Временное правило для iframe Flow, которое ставит Anti-Sleep в попапе
+  chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [tabId] }).catch(() => {});
   let changed = false;
   for (const key of Object.keys(frameConfigs)) {
     if (key.startsWith(`${tabId}:`)) {

@@ -1,5 +1,7 @@
 /**
- * Внедряется во вкладку SillyTavern (127.0.0.1 / localhost).
+ * Внедряется во вкладку SillyTavern (127.0.0.1 / localhost). Срабатывает,
+ * только если на странице действительно SillyTavern: другие сайты на
+ * localhost не получают ни iframe, ни звука.
  *
  * Вставляет скрытый iframe с Google Flow. Смысл в том, что на Android
  * отдельная вкладка Flow живёт недолго — система её замораживает и выгружает,
@@ -28,8 +30,6 @@ function injectIframe() {
   iframe.style.cssText =
     'width:360px;height:640px;position:fixed;bottom:0;right:0;pointer-events:none;' +
     'z-index:-9999;border:0;clip-path:inset(50%);';
-  // autoplay нужен, чтобы внутри фрейма при необходимости мог играть keepalive-звук
-  iframe.allow = 'autoplay; camera; microphone';
   document.body.appendChild(iframe);
   return iframe;
 }
@@ -55,11 +55,26 @@ function startIframeGuard() {
   }, IFRAME_RELOAD_MS);
 }
 
+// Поле ввода и чат есть в разметке SillyTavern с самого начала
+function isSillyTavern() {
+  return !!(document.getElementById('send_textarea') && document.getElementById('chat'));
+}
+
 function boot() {
-  // Вкладка SillyTavern открыта всё время игры — именно её мы и защищаем
-  // от засыпания звуковой медиа-сессией (см. keepalive.js).
-  flowStartAudioKeepalive();
-  setTimeout(startIframeGuard, 2000);
+  const started = Date.now();
+  const check = () => {
+    if (isSillyTavern()) {
+      // Вкладка SillyTavern открыта всё время игры — именно её мы и защищаем
+      // от засыпания звуковой медиа-сессией (см. keepalive.js).
+      flowStartAudioKeepalive();
+      setTimeout(startIframeGuard, 2000);
+    } else if (Date.now() - started < 15000) {
+      setTimeout(check, 1000);
+    } else {
+      console.log('[Flow] Это не SillyTavern — iframe и звук не включаем');
+    }
+  };
+  check();
 }
 
 if (document.readyState === 'complete') {
